@@ -64,6 +64,10 @@ shift every later answer by one).
 component, so clients should extract the name defensively rather than assume a
 bare player name.
 
+Entity records for players carry `name` (and `gameMode`), because a client
+cannot otherwise tell one player from another - and a Carpet fake player is
+just a player entity as far as the client is concerned.
+
 Per-tick samples are appended to `<gameDir>/mc-agent/samples.jsonl`.
 
 ## Build

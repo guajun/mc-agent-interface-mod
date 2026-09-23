@@ -18,6 +18,7 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.monster.cubemob.SulfurCube;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 
 import java.nio.file.Path;
@@ -544,6 +545,12 @@ public final class InterfaceCore {
                 object.addProperty("bodyItem", body.getItem().getDescriptionId());
                 object.addProperty("bodyCount", body.getCount());
             }
+        }
+        if (entity instanceof Player player) {
+            // Without this the entity list cannot tell one player from another -
+            // and fake players are just players as far as the client is concerned.
+            object.addProperty("name", player.getName().getString());
+            object.addProperty("gameMode", player.isCreative() ? "creative" : "survival");
         }
         if (entity instanceof SulfurCube cube) {
             object.addProperty("fuse", cube.getFuse());
