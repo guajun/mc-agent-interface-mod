@@ -2,8 +2,8 @@
 
 📖 Part of **mc-agent**; the guide lives at <https://guajun.github.io/mc-agent/>.
 
-Generic Fabric client mod that exposes a local, versioned interface for agent
-runtimes.
+Generic Fabric mod that exposes a local, versioned interface for agent runtimes.
+One jar, two entrypoints: a **client vantage** and a **server vantage**.
 
 This module is the **game adapter**. It contains no agent logic and no
 use-case logic (no cannon, sulfur cube, pathfinding, or analysis code). It only
@@ -115,9 +115,25 @@ player and on any server, and they need nothing but the mod.
 
 ## Where this runs, and who the player is
 
-The mod is a **client** mod (`"environment": "client"`). It is never loaded by a
-dedicated server and it needs no server-side plugin, so it works against
-vanilla, Paper or Fabric servers alike. It only needs a socket to the bridge.
+`"environment": "*"`, with both entrypoints in the same jar. Fabric loads only
+the one that matches where it is running:
+
+| Entrypoint | Runs in | Serves |
+| --- | --- | --- |
+| `client` (`InterfaceMod`) | any client | the **client vantage**: what that client can see and do, screens, opening a save, publishing the world to the LAN |
+| `main` (`ServerMod`) | any server - a dedicated one, **or the integrated server inside a single-player world** | the **server vantage**: authoritative state, console commands, snapshots |
+
+Neither entrypoint needs the other, and neither needs a server-side plugin in the
+world: vanilla, Paper and Fabric servers are all fine. All either of them needs is
+a loopback socket to the bridge.
+
+**In single player both run at once, in the same process**: the client vantage on
+`mcagent.port` (25580 by default) and the server vantage on `mcagent.serverPort`
+(25581), with their data in `<gameDir>/mc-agent/` and `mc-agent-server/`
+respectively (`-Dmcagent.dir` / `-Dmcagent.serverDir` to move them). So the
+server-side capabilities - authoritative entity state, `/data get`-quality
+numbers, the entity tick order, snapshots - are available while you play, with no
+server to set up.
 
 It also does **not** create a player. The mod runs inside one client, and
 whatever the bridge asks for happens through that client's player - so by
@@ -135,6 +151,11 @@ Each bridge owns one client's socket, so the two never fight over the same
 player. On an offline-mode server, instance B can simply use a different player
 name; on an online-mode server it needs its own account. Launch instance B with
 `-Dmcagent.autoConnect=host:port` and it walks into the world by itself.
+
+If you only need a body and not a client, a Carpet fake player is cheaper: the
+server vantage can spawn and drive one, and the server can broadcast its replies
+as its own voice. See
+[who is the agent in game](https://guajun.github.io/mc-agent/player-identity/).
 
 Open question (RFC 0001): whether the bridge should arbitrate between agents
 attached to the *same* client, so two loops cannot fight over one player.
