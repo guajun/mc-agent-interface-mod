@@ -8,7 +8,7 @@ package dev.mcagent.interfacemod;
  */
 public final class InterfaceConstants {
     public static final String MOD_ID = "mc-agent-interface";
-    public static final String VERSION = "0.5.0";
+    public static final String VERSION = "0.5.2";
     public static final int PROTOCOL_VERSION = 1;
 
     public static final int DEFAULT_CLIENT_PORT = 25580;

@@ -290,7 +290,15 @@ public final class ServerCore implements LineHandler {
             }
             EntityTickList list = (EntityTickList) tickListField.get(level);
             if (list != null) {
-                list.forEach(entities::add);
+                list.forEach(entity -> {
+                    // The tick list can still hold entities that are dying or already
+                    // removed (it is only cleaned up as the ticking loop runs). A
+                    // snapshot is the world that exists, so drop them here rather
+                    // than handing a caller ghosts.
+                    if (!entity.isRemoved() && entity.isAlive()) {
+                        entities.add(entity);
+                    }
+                });
             }
         } catch (ReflectiveOperationException | RuntimeException exception) {
             throw new IllegalStateException("cannot read the entity tick order: " + exception, exception);
@@ -367,6 +375,21 @@ public final class ServerCore implements LineHandler {
             entities = within;
         }
 
+        // A snapshot is "the world state that can be put back". A player cannot be
+        // recreated with /summon, so players are recorded in meta (name, uuid,
+        // position) and kept out of the entity list - otherwise a restore could
+        // never reproduce the recorded order hash.
+        List<Entity> players = new ArrayList<>();
+        List<Entity> restorable = new ArrayList<>();
+        for (Entity entity : entities) {
+            if (entity instanceof ServerPlayer) {
+                players.add(entity);
+            } else {
+                restorable.add(entity);
+            }
+        }
+        entities = restorable;
+
         Path snapshotDir = dir.resolve("snapshots").resolve(name);
         Path entitiesFile = snapshotDir.resolve("entities.jsonl");
         boolean replaced = Files.exists(entitiesFile);
@@ -400,11 +423,15 @@ public final class ServerCore implements LineHandler {
                         passengers.add(passenger.getStringUUID());
                     }
                     entry.add("passengers", passengers);
-                    entry.addProperty("vehicle", entity.getVehicle() == null
-                            ? null : entity.getVehicle().getStringUUID());
-                    // A player cannot be recreated with /summon; say so instead of
-                    // letting a restore fail halfway.
-                    entry.addProperty("restorable", !(entity instanceof ServerPlayer));
+                    if (entity.getVehicle() == null) {
+                        entry.add("vehicle", com.google.gson.JsonNull.INSTANCE);
+                    } else {
+                        entry.addProperty("vehicle", entity.getVehicle().getStringUUID());
+                    }
+                    // Passengers come back with their vehicle (their NBT is nested
+                    // inside it), so a restore has to skip them rather than summon
+                    // them twice. The flag says which ones.
+                    entry.addProperty("restorable", entity.getVehicle() == null);
                     writer.write(GSON.toJson(entry));
                     writer.newLine();
                 }
@@ -416,6 +443,16 @@ public final class ServerCore implements LineHandler {
         }
 
         String hash = orderHash(entities);
+        JsonArray playerInfo = new JsonArray();
+        for (Entity player : players) {
+            JsonObject entry = new JsonObject();
+            entry.addProperty("name", player.getName().getString());
+            entry.addProperty("uuid", player.getStringUUID());
+            entry.addProperty("x", player.getX());
+            entry.addProperty("y", player.getY());
+            entry.addProperty("z", player.getZ());
+            playerInfo.add(entry);
+        }
         JsonObject meta = base("meta");
         meta.addProperty("protocol", InterfaceConstants.PROTOCOL_VERSION);
         meta.addProperty("mod", InterfaceConstants.MOD_ID);
@@ -426,6 +463,8 @@ public final class ServerCore implements LineHandler {
         meta.addProperty("dimension", level.dimension().identifier().toString());
         meta.addProperty("radius", radius);
         meta.addProperty("entities", entities.size());
+        meta.addProperty("playersSkipped", players.size());
+        meta.add("players", playerInfo);
         meta.addProperty("orderHash", hash);
         meta.addProperty("createdAt", System.currentTimeMillis());
         meta.addProperty("worldDir", server.getWorldPath(LevelResource.ROOT).toAbsolutePath().toString());
