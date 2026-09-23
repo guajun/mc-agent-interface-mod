@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "mc-agent-interface",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "name": "MC Agent Interface",
   "description": "Generic local interface for agent runtimes: state, entities, commands, chat, recording and events.",
   "environment": "client",

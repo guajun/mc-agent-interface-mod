@@ -3,6 +3,7 @@ package dev.mcagent.interfacemod;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -46,6 +47,14 @@ public final class McAgentCommands {
                                         DoubleArgumentType.getDouble(context, "radius")))))
                 .then(ClientCommands.literal("port")
                         .executes(context -> port(core, context.getSource())))
+                .then(ClientCommands.literal("lan")
+                        .executes(context -> lan(core, context.getSource(), 0, null))
+                        .then(ClientCommands.argument("port", IntegerArgumentType.integer(1024, 65535))
+                                .executes(context -> lan(core, context.getSource(),
+                                        IntegerArgumentType.getInteger(context, "port"), null))
+                                .then(ClientCommands.literal("offline")
+                                        .executes(context -> lan(core, context.getSource(),
+                                                IntegerArgumentType.getInteger(context, "port"), true)))))
                 .then(ClientCommands.literal("caps")
                         .executes(context -> caps(context.getSource())))
                 .then(ClientCommands.literal("mark")
@@ -147,6 +156,19 @@ public final class McAgentCommands {
         return 1;
     }
 
+    /** Open the world to the LAN so a second client (the agent) can join. */
+    private static int lan(InterfaceCore core, FabricClientCommandSource source, int port, Boolean offline) {
+        core.publishLan(port, offline, line -> {
+            JsonObject answer = JsonParser.parseString(line).getAsJsonObject();
+            if (answer.has("message")) {
+                feedback(source, "mc-agent: " + answer.get("message").getAsString());
+                return;
+            }
+            feedback(source, "LAN: " + answer.get("detail").getAsString());
+        });
+        return 1;
+    }
+
     private static int caps(FabricClientCommandSource source) {
         feedback(source, "capabilities: " + InterfaceMod.CAPABILITIES
                 .replace("[", "").replace("]", "").replace("\"", ""));
@@ -178,6 +200,7 @@ public final class McAgentCommands {
         feedback(source, "/mcagent state - position, velocity, health, dimension");
         feedback(source, "/mcagent entities [radius] - nearby entities");
         feedback(source, "/mcagent port - the port a bridge should dial");
+        feedback(source, "/mcagent lan [port] [offline] - open this world to the LAN");
         feedback(source, "/mcagent caps - protocol capabilities");
         feedback(source, "/mcagent mark <text> - annotate the event stream");
         feedback(source, "/mcagent record start <ticks> [radius] [interval] | record stop");

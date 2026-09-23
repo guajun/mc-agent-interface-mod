@@ -51,6 +51,10 @@ public final class EventSink {
     }
 
     public void emit(JsonObject object) {
+        // Mark the line as an event. Replies come from one place in the core and
+        // have a closed set of types; events do not, so clients must be told
+        // rather than left to guess from the type name.
+        object.addProperty("event", true);
         queue.offer(gson.toJson(object));
     }
 

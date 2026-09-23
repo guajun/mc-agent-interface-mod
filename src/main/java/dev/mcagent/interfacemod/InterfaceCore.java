@@ -11,6 +11,8 @@ import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.server.IntegratedServer;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
@@ -169,6 +171,13 @@ public final class InterfaceCore {
             } else if (upper.startsWith("WORLD ")) {
                 String level = line.substring(6).trim();
                 submit(() -> openWorld(level, reply));
+            } else if (upper.equals("LAN")) {
+                submit(() -> publishLan(0, null, reply));
+            } else if (upper.startsWith("LAN ")) {
+                String[] parts = line.substring(4).trim().split("\\s+");
+                int lanPort = parts.length > 0 && !parts[0].isEmpty() ? Integer.parseInt(parts[0]) : 0;
+                Boolean offline = parts.length > 1 ? parseOffline(parts[1]) : null;
+                submit(() -> publishLan(lanPort, offline, reply));
             } else if (upper.startsWith("MARK ")) {
                 emit("mark", line.substring(5));
                 reply.accept(ack("mark", line.substring(5)).toString());
@@ -327,6 +336,72 @@ public final class InterfaceCore {
         } catch (Throwable throwable) {
             reply.accept(errorJson("world failed: " + throwable).toString());
         }
+    }
+
+    /**
+     * Publish the integrated server on the LAN - the "Open to LAN" button, without
+     * the button - and answer with the port to dial.
+     *
+     * This is what lets an agent be a player of its own in a single-player world:
+     * the owner's client hosts, the agent's client joins under a separate name, and
+     * neither of them touches the other's account or inventory.
+     *
+     * Calling it while already published is a status query, so a caller can poll
+     * until the real port is known.
+     */
+    public void publishLan(int port, Boolean offline, Consumer<String> reply) {
+        Minecraft client = Minecraft.getInstance();
+        if (!client.hasSingleplayerServer()) {
+            reply.accept(errorJson("no single-player world is open").toString());
+            return;
+        }
+        IntegratedServer server = client.getSingleplayerServer();
+        if (server == null) {
+            reply.accept(errorJson("no single-player server").toString());
+            return;
+        }
+        if (offline != null) {
+            // A spare client with no Mojang session (the agent's own player) cannot
+            // pass the session check, so the host can deliberately accept offline
+            // names. Only ever meaningful on a LAN.
+            boolean useAuthentication = !offline;
+            server.execute(() -> server.setUsesAuthentication(useAuthentication));
+        }
+        String address = server.getLocalIp() == null ? "localhost" : server.getLocalIp();
+        if (server.isPublished()) {
+            reply.accept(ack("lan", "port=" + server.getPort() + " address=" + address
+                    + " online=" + server.usesAuthentication()).toString());
+            return;
+        }
+        try {
+            boolean published = server.publishServer(
+                    MinecraftServer.MultiplayerScope.LAN,
+                    server.getWorldData().getGameType(),
+                    server.getWorldData().isAllowCommands(),
+                    Math.max(0, port));
+            if (!published) {
+                reply.accept(errorJson("publishServer refused").toString());
+                return;
+            }
+            emit("lan", "port=" + server.getPort() + " address=" + address);
+            reply.accept(ack("lan", "port=" + server.getPort() + " address=" + address
+                    + " gamemode=" + server.getWorldData().getGameType().getName()
+                    + " cheats=" + server.getWorldData().isAllowCommands()
+                    + " online=" + server.usesAuthentication()).toString());
+        } catch (Throwable throwable) {
+            reply.accept(errorJson("lan failed: " + throwable).toString());
+        }
+    }
+
+    private static Boolean parseOffline(String token) {
+        String value = token.toLowerCase(Locale.ROOT);
+        if (value.equals("offline") || value.equals("false") || value.equals("0")) {
+            return Boolean.TRUE;
+        }
+        if (value.equals("online") || value.equals("true") || value.equals("1")) {
+            return Boolean.FALSE;
+        }
+        throw new IllegalArgumentException("expected online or offline, got " + token);
     }
 
     public JsonObject screenJson() {

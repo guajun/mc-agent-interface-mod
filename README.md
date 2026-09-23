@@ -38,6 +38,7 @@ stable:
 | `SCREEN` | current screen/class (diagnostics) |
 | `CONNECT <host:port>` | connect the client to a server |
 | `WORLD <level>` | open a single-player save by folder name |
+| `LAN [port] [online\|offline]` | publish the integrated server to the LAN |
 | `MARK <text>` | write a marker into the event stream |
 | `CAPS` | protocol version and capabilities |
 | `PING` | liveness check |
@@ -49,10 +50,15 @@ Events are pushed to every connected client and appended to
 `<gameDir>/mc-agent/events.jsonl`:
 
 ```json
-{"type":"chat","millis":...,"text":"hello","sender":"LiteralComponent{content='name',...}"}
-{"type":"game","millis":...,"text":"..."}
-{"type":"sample_start","millis":...,"text":"ticks=600 radius=32 interval=1"}
+{"type":"chat","millis":...,"event":true,"text":"hello","sender":"LiteralComponent{content='name',...}"}
+{"type":"game","millis":...,"event":true,"text":"..."}
+{"type":"sample_start","millis":...,"event":true,"text":"ticks=600 radius=32 interval=1"}
 ```
+
+`"event": true` marks a pushed event. Replies to requests never carry it, so a
+client can route lines without keeping a list of every event name - which is
+what the bridge does (a new event type used to be mistaken for a reply and
+shift every later answer by one).
 
 `text` is the message content; `sender` is the stringified display-name
 component, so clients should extract the name defensively rather than assume a
