@@ -28,7 +28,7 @@ import java.util.Locale;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.function.Consumer;
 
-public final class InterfaceCore {
+public final class InterfaceCore implements LineHandler {
     private final ConcurrentLinkedQueue<Runnable> tasks = new ConcurrentLinkedQueue<>();
     private final EventSink sink;
     private final InterfaceServer server;
@@ -49,7 +49,7 @@ public final class InterfaceCore {
     public InterfaceCore(Path dir, int port) {
         this.sinkDir = dir;
         this.sink = new EventSink(dir);
-        this.server = new InterfaceServer(port, this);
+        this.server = new InterfaceServer(port, this, "client", InterfaceConstants.CLIENT_CAPABILITIES);
     }
 
     public void start() {
@@ -263,10 +263,10 @@ public final class InterfaceCore {
 
     private JsonObject capabilitiesJson() {
         JsonObject object = base("capabilities");
-        object.addProperty("protocol", InterfaceMod.PROTOCOL_VERSION);
-        object.addProperty("mod", InterfaceMod.MOD_ID);
-        object.addProperty("version", InterfaceMod.VERSION);
-        object.add("capabilities", com.google.gson.JsonParser.parseString(InterfaceMod.CAPABILITIES));
+        object.addProperty("protocol", InterfaceConstants.PROTOCOL_VERSION);
+        object.addProperty("mod", InterfaceConstants.MOD_ID);
+        object.addProperty("version", InterfaceConstants.VERSION);
+        object.add("capabilities", com.google.gson.JsonParser.parseString(InterfaceConstants.CLIENT_CAPABILITIES));
         return object;
     }
 
@@ -420,8 +420,8 @@ public final class InterfaceCore {
     public JsonObject stateJson() {
         Minecraft client = Minecraft.getInstance();
         JsonObject object = base("state");
-        object.addProperty("protocol", InterfaceMod.PROTOCOL_VERSION);
-        object.addProperty("modVersion", InterfaceMod.VERSION);
+        object.addProperty("protocol", InterfaceConstants.PROTOCOL_VERSION);
+        object.addProperty("modVersion", InterfaceConstants.VERSION);
         object.addProperty("tick", tickCounter);
         object.addProperty("clients", server.clientCount());
         object.addProperty("bridgePort", server.getPort());
@@ -469,7 +469,7 @@ public final class InterfaceCore {
                 if (radius > 0.0D && dx * dx + dy * dy + dz * dz > radiusSquared) {
                     continue;
                 }
-                array.add(entityJson(entity));
+                array.add(EntityJson.toJson(entity));
             }
         }
         object.add("entities", array);
@@ -504,63 +504,12 @@ public final class InterfaceCore {
                 if (radius > 0.0D && dx * dx + dy * dy + dz * dz > radiusSquared) {
                     continue;
                 }
-                array.add(entityJson(entity));
+                array.add(EntityJson.toJson(entity));
             }
         }
         object.add("entities", array);
         return object;
     }
-
-    private JsonObject entityJson(Entity entity) {
-        JsonObject object = new JsonObject();
-        object.addProperty("id", entity.getId());
-        object.addProperty("uuid", entity.getStringUUID());
-        object.addProperty("type", EntityType.getKey(entity.getType()).toString());
-        object.addProperty("class", entity.getClass().getSimpleName());
-        object.addProperty("x", entity.getX());
-        object.addProperty("y", entity.getY());
-        object.addProperty("z", entity.getZ());
-        object.addProperty("vx", entity.getDeltaMovement().x);
-        object.addProperty("vy", entity.getDeltaMovement().y);
-        object.addProperty("vz", entity.getDeltaMovement().z);
-        object.addProperty("yaw", entity.getYRot());
-        object.addProperty("pitch", entity.getXRot());
-        object.addProperty("alive", entity.isAlive());
-        object.addProperty("removed", entity.isRemoved());
-        object.addProperty("invulnerable", entity.isInvulnerable());
-        object.addProperty("onGround", entity.onGround());
-        object.addProperty("vehicle", entity.getVehicle() == null ? -1 : entity.getVehicle().getId());
-        object.addProperty("isVehicle", entity.isVehicle());
-        JsonArray passengers = new JsonArray();
-        for (Entity passenger : entity.getPassengers()) {
-            passengers.add(passenger.getId());
-        }
-        object.add("passengers", passengers);
-        if (entity instanceof LivingEntity living) {
-            object.addProperty("health", living.getHealth());
-            object.addProperty("maxHealth", living.getMaxHealth());
-            ItemStack body = living.getItemBySlot(EquipmentSlot.BODY);
-            object.addProperty("bodyEmpty", body.isEmpty());
-            if (!body.isEmpty()) {
-                object.addProperty("bodyItem", body.getItem().getDescriptionId());
-                object.addProperty("bodyCount", body.getCount());
-            }
-        }
-        if (entity instanceof Player player) {
-            // Without this the entity list cannot tell one player from another -
-            // and fake players are just players as far as the client is concerned.
-            object.addProperty("name", player.getName().getString());
-            object.addProperty("gameMode", player.isCreative() ? "creative" : "survival");
-        }
-        if (entity instanceof SulfurCube cube) {
-            object.addProperty("fuse", cube.getFuse());
-            object.addProperty("primed", cube.isPrimed());
-            object.addProperty("hasBody", cube.hasBodyItem());
-            object.addProperty("readyForShearing", cube.readyForShearing());
-        }
-        return object;
-    }
-
     private JsonObject base(String type) {
         JsonObject object = new JsonObject();
         object.addProperty("type", type);

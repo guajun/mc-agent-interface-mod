@@ -8,13 +8,6 @@ import net.fabricmc.loader.api.FabricLoader;
 import java.nio.file.Path;
 
 public final class InterfaceMod implements ClientModInitializer {
-    public static final String MOD_ID = "mc-agent-interface";
-    public static final String VERSION = "0.4.2";
-    public static final int PROTOCOL_VERSION = 1;
-    public static final String CAPABILITIES =
-            "[\"state\",\"entities\",\"command\",\"chat\",\"record\",\"wait\",\"screen\",\"mark\",\"connect\","
-                    + "\"world\",\"lan\",\"events:chat\",\"events:game\"]";
-
     private static InterfaceCore core;
 
     @Override
@@ -23,7 +16,7 @@ public final class InterfaceMod implements ClientModInitializer {
         Path dir = dirProperty == null || dirProperty.isBlank()
                 ? FabricLoader.getInstance().getGameDir().resolve("mc-agent")
                 : Path.of(dirProperty);
-        int port = Integer.getInteger("mcagent.port", 25580);
+        int port = Integer.getInteger("mcagent.port", InterfaceConstants.DEFAULT_CLIENT_PORT);
         core = new InterfaceCore(dir, port);
         core.setAutoConnect(System.getProperty("mcagent.autoConnect", ""));
         ClientTickEvents.END_CLIENT_TICK.register(core::onClientTick);

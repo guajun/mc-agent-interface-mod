@@ -26,6 +26,7 @@ public final class EventSink {
     private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
     private final Path dir;
     private volatile boolean running = true;
+    private Thread writer;
 
     public EventSink(Path dir) {
         this.dir = dir;
@@ -45,9 +46,17 @@ public final class EventSink {
         } catch (IOException exception) {
             System.err.println("[mc-agent-interface] cannot create " + dir + ": " + exception);
         }
-        Thread writer = new Thread(this::writeLoop, "mc-agent-interface-sink");
+        writer = new Thread(this::writeLoop, "mc-agent-interface-sink");
         writer.setDaemon(true);
         writer.start();
+    }
+
+    /** Stop writing; used when a server lifecycle ends and the core is discarded. */
+    public void stop() {
+        running = false;
+        if (writer != null) {
+            writer.interrupt();
+        }
     }
 
     public void emit(JsonObject object) {

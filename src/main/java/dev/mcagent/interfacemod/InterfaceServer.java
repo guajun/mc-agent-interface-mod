@@ -14,16 +14,20 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 public final class InterfaceServer {
     private final int basePort;
-    private final InterfaceCore core;
+    private final LineHandler handler;
+    private final String instance;
+    private final String capabilities;
     private final CopyOnWriteArrayList<Client> clients = new CopyOnWriteArrayList<>();
     private volatile boolean running = true;
     private ServerSocket serverSocket;
     private volatile int port;
 
-    public InterfaceServer(int basePort, InterfaceCore core) {
+    public InterfaceServer(int basePort, LineHandler handler, String instance, String capabilities) {
         this.basePort = basePort;
         this.port = basePort;
-        this.core = core;
+        this.handler = handler;
+        this.instance = instance;
+        this.capabilities = capabilities;
     }
 
     public boolean start() {
@@ -60,6 +64,22 @@ public final class InterfaceServer {
         return clients.size();
     }
 
+    /** Close the listener and hang up; a world can be closed and reopened. */
+    public void stop() {
+        running = false;
+        try {
+            if (serverSocket != null) {
+                serverSocket.close();
+            }
+        } catch (IOException ignored) {
+            // closing
+        }
+        for (Client client : clients) {
+            client.close();
+        }
+        clients.clear();
+    }
+
     private void acceptLoop() {
         try {
             while (running) {
@@ -88,11 +108,12 @@ public final class InterfaceServer {
             Thread thread = new Thread(this::readLoop, "mc-agent-interface-client");
             thread.setDaemon(true);
             thread.start();
-            send("{\"type\":\"hello\",\"mod\":\"" + InterfaceMod.MOD_ID
-                    + "\",\"version\":\"" + InterfaceMod.VERSION
-                    + "\",\"protocol\":" + InterfaceMod.PROTOCOL_VERSION
+            send("{\"type\":\"hello\",\"mod\":\"" + InterfaceConstants.MOD_ID
+                    + "\",\"version\":\"" + InterfaceConstants.VERSION
+                    + "\",\"protocol\":" + InterfaceConstants.PROTOCOL_VERSION
                     + ",\"minecraft\":\"26.2\",\"port\":" + port
-                    + ",\"capabilities\":" + InterfaceMod.CAPABILITIES + "}");
+                    + ",\"instance\":\"" + instance + "\""
+                    + ",\"capabilities\":" + capabilities + "}");
         }
 
         private void readLoop() {
@@ -100,7 +121,7 @@ public final class InterfaceServer {
                     new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    core.handleLine(line.trim(), this::send);
+                    handler.handleLine(line.trim(), this::send);
                 }
             } catch (IOException ignored) {
                 // client disconnected

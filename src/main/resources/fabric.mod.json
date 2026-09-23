@@ -1,11 +1,14 @@
 {
   "schemaVersion": 1,
   "id": "mc-agent-interface",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "name": "MC Agent Interface",
   "description": "Generic local interface for agent runtimes: state, entities, commands, chat, recording and events.",
-  "environment": "client",
+  "environment": "*",
   "entrypoints": {
+    "main": [
+      "dev.mcagent.interfacemod.ServerMod"
+    ],
     "client": [
       "dev.mcagent.interfacemod.InterfaceMod"
     ]

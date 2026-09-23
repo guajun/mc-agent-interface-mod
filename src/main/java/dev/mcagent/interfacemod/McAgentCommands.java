@@ -85,7 +85,7 @@ public final class McAgentCommands {
     private static int status(InterfaceCore core, FabricClientCommandSource source) {
         JsonObject screen = core.screenJson();
         feedback(source, String.format(Locale.ROOT,
-                "mc-agent-interface %s (protocol %d)", InterfaceMod.VERSION, InterfaceMod.PROTOCOL_VERSION));
+                "mc-agent-interface %s (protocol %d)", InterfaceConstants.VERSION, InterfaceConstants.PROTOCOL_VERSION));
         feedback(source, String.format(Locale.ROOT,
                 "port=%d  bridgeClients=%d  tick=%d  inWorld=%s  recording=%s",
                 core.port(), core.clientCount(), core.tick(), screen.get("inWorld"), core.isSampling()));
@@ -170,7 +170,7 @@ public final class McAgentCommands {
     }
 
     private static int caps(FabricClientCommandSource source) {
-        feedback(source, "capabilities: " + InterfaceMod.CAPABILITIES
+        feedback(source, "capabilities: " + InterfaceConstants.CLIENT_CAPABILITIES
                 .replace("[", "").replace("]", "").replace("\"", ""));
         return 1;
     }
