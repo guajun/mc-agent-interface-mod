@@ -37,6 +37,7 @@ stable:
 | `WAIT <ticks>` | respond after N client ticks (useful for scripted experiments) |
 | `SCREEN` | current screen/class (diagnostics) |
 | `CONNECT <host:port>` | connect the client to a server |
+| `WORLD <level>` | open a single-player save by folder name |
 | `MARK <text>` | write a marker into the event stream |
 | `CAPS` | protocol version and capabilities |
 | `PING` | liveness check |

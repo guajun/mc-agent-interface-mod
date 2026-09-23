@@ -166,6 +166,9 @@ public final class InterfaceCore {
             } else if (upper.startsWith("CONNECT ")) {
                 String address = line.substring(8).trim();
                 submit(() -> connect(address, reply));
+            } else if (upper.startsWith("WORLD ")) {
+                String level = line.substring(6).trim();
+                submit(() -> openWorld(level, reply));
             } else if (upper.startsWith("MARK ")) {
                 emit("mark", line.substring(5));
                 reply.accept(ack("mark", line.substring(5)).toString());
@@ -298,6 +301,31 @@ public final class InterfaceCore {
             reply.accept(ack("connect", address).toString());
         } catch (Throwable throwable) {
             reply.accept(errorJson("connect failed: " + throwable).toString());
+        }
+    }
+
+    /**
+     * Open a single-player level by its folder name, once the client is idle.
+     *
+     * This is the counterpart of CONNECT for single player: the agent can start
+     * its own world instead of depending on the quick-play command line, which
+     * loads the level before other mods finish initialising.
+     */
+    private void openWorld(String levelId, Consumer<String> reply) {
+        Minecraft client = Minecraft.getInstance();
+        if (client.level != null || client.getConnection() != null) {
+            reply.accept(errorJson("already in a world").toString());
+            return;
+        }
+        if (levelId.isEmpty()) {
+            reply.accept(errorJson("no level name given").toString());
+            return;
+        }
+        try {
+            client.createWorldOpenFlows().openWorld(levelId, () -> emit("world_failed", levelId));
+            reply.accept(ack("world", levelId).toString());
+        } catch (Throwable throwable) {
+            reply.accept(errorJson("world failed: " + throwable).toString());
         }
     }
 

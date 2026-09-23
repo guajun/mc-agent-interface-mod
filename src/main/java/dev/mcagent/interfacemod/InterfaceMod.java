@@ -9,11 +9,11 @@ import java.nio.file.Path;
 
 public final class InterfaceMod implements ClientModInitializer {
     public static final String MOD_ID = "mc-agent-interface";
-    public static final String VERSION = "0.2.0";
+    public static final String VERSION = "0.3.0";
     public static final int PROTOCOL_VERSION = 1;
     public static final String CAPABILITIES =
             "[\"state\",\"entities\",\"command\",\"chat\",\"record\",\"wait\",\"screen\",\"mark\",\"connect\","
-                    + "\"events:chat\",\"events:game\"]";
+                    + "\"world\",\"events:chat\",\"events:game\"]";
 
     private static InterfaceCore core;
 
