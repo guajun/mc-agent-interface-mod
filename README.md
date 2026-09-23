@@ -80,6 +80,51 @@ Output: `dist/mc-agent-interface-0.1.0.jar`. Put it together with
 | --- | --- | --- |
 | `mcagent.dir` | `<gameDir>/mc-agent` | directory for `port.txt`, event and sample files |
 | `mcagent.port` | `25580` | first port to try; the mod falls back to the next free port |
+| `mcagent.autoConnect` | unset | `host:port`; join that server from the title screen on startup |
+
+## In-game commands
+
+The same primitives are available as client-side commands, so a human can check
+the interface without a bridge or a model:
+
+| Command | Shows |
+| --- | --- |
+| `/mcagent` or `/mcagent status` | mod version, protocol, port, connected bridges, tick, recording |
+| `/mcagent state` | position, velocity, health, entity count, dimension |
+| `/mcagent entities [radius]` | nearby entities with id, type, position, velocity |
+| `/mcagent port` | the port a bridge should dial |
+| `/mcagent caps` | protocol capabilities |
+| `/mcagent mark <text>` | writes a marker into the event stream |
+| `/mcagent record start <ticks> [radius] [interval]` / `record stop` | per-tick sampling |
+
+These are client commands: they never reach the server, they work in single
+player and on any server, and they need nothing but the mod.
+
+## Where this runs, and who the player is
+
+The mod is a **client** mod (`"environment": "client"`). It is never loaded by a
+dedicated server and it needs no server-side plugin, so it works against
+vanilla, Paper or Fabric servers alike. It only needs a socket to the bridge.
+
+It also does **not** create a player. The mod runs inside one client, and
+whatever the bridge asks for happens through that client's player - so by
+default the agent acts as *your* character.
+
+To have the agent be a player of its own, run a second client instance with the
+mod and point a bridge (or a second bridge) at that instance's `port.txt`:
+
+```
+instance A (you)        -> mc-agent/port.txt -> bridge A -> your agent loop
+instance B (the agent)  -> mc-agent/port.txt -> bridge B -> its agent loop
+```
+
+Each bridge owns one client's socket, so the two never fight over the same
+player. On an offline-mode server, instance B can simply use a different player
+name; on an online-mode server it needs its own account. Launch instance B with
+`-Dmcagent.autoConnect=host:port` and it walks into the world by itself.
+
+Open question (RFC 0001): whether the bridge should arbitrate between agents
+attached to the *same* client, so two loops cannot fight over one player.
 
 ## Scope
 

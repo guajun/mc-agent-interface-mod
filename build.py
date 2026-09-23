@@ -30,6 +30,7 @@ API_MODULES = (
     "fabric-api-base-",
     "fabric-lifecycle-events-v1-",
     "fabric-message-api-v1-",
+    "fabric-command-api-v2-",
 )
 
 
@@ -154,7 +155,10 @@ def main():
     subprocess.run([str(javac), f"@{args_file}"], check=True)
     output = Path(arguments.output)
     output.mkdir(parents=True, exist_ok=True)
-    target = output / "mc-agent-interface-0.1.0.jar"
+    metadata = json.loads(
+        (PROJECT / "src" / "main" / "resources" / "fabric.mod.json").read_text(encoding="utf-8")
+    )
+    target = output / f"mc-agent-interface-{metadata['version']}.jar"
     subprocess.run(
         [str(jar), "--create", "--file", str(target), "-C", str(out_dir), ".", "-C", str(RESOURCES), "."],
         check=True,

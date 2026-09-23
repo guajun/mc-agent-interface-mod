@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.ServerData;
@@ -37,6 +38,10 @@ public final class InterfaceCore {
     private int sampleCounter;
     private long sampleIndex;
     private int tickCounter;
+
+    private String autoConnect;
+    private int autoConnectAt = 100;
+    private int autoConnectAttempts;
 
     public InterfaceCore(Path dir, int port) {
         this.sinkDir = dir;
@@ -83,6 +88,37 @@ public final class InterfaceCore {
                 emit("sample_done", "samples=" + sampleIndex);
             }
         }
+        autoConnectTick(client);
+    }
+
+    /**
+     * Join a server on startup when {@code -Dmcagent.autoConnect=host:port} is set.
+     *
+     * This is what turns a spare client into a player the agent owns: launch the
+     * instance and it walks into the world by itself. It only ever acts from the
+     * title screen or with no screen open, so it cannot interrupt somebody who is
+     * already using the client, and it gives up after a handful of attempts.
+     */
+    private void autoConnectTick(Minecraft client) {
+        if (autoConnect == null || autoConnect.isBlank() || autoConnectAttempts >= 10) {
+            return;
+        }
+        if (client.level != null || tickCounter < autoConnectAt) {
+            return;
+        }
+        Screen screen = client.gui == null ? null : client.gui.screen();
+        if (screen != null && !(screen instanceof TitleScreen)) {
+            return;
+        }
+        autoConnectAt = tickCounter + 200;
+        autoConnectAttempts++;
+        emit("auto_connect", "attempt=" + autoConnectAttempts + " address=" + autoConnect);
+        connect(autoConnect, line -> {
+        });
+    }
+
+    public void setAutoConnect(String address) {
+        this.autoConnect = address;
     }
 
     public void handleLine(String line, Consumer<String> reply) {
@@ -106,7 +142,7 @@ public final class InterfaceCore {
                 submit(() -> reply.accept(entitiesJson(radius).toString()));
             } else if (upper.equals("SAMPLE_STOP") || upper.equals("RECORD_STOP")) {
                 submit(() -> {
-                    sampling = false;
+                    applySampleStop();
                     reply.accept(ack("sample_stop", "samples=" + sampleIndex).toString());
                 });
             } else if (upper.startsWith("SAMPLE_START") || upper.startsWith("RECORD_START")) {
@@ -115,14 +151,7 @@ public final class InterfaceCore {
                 double radius = parts.length > 2 ? Double.parseDouble(parts[2]) : 64.0D;
                 int interval = parts.length > 3 ? Integer.parseInt(parts[3]) : 1;
                 submit(() -> {
-                    sampling = true;
-                    sampleTicksRemaining = Math.max(1, ticks);
-                    sampleRadius = radius;
-                    sampleInterval = Math.max(1, interval);
-                    sampleCounter = 0;
-                    sampleIndex = 0;
-                    emit("sample_start", "ticks=" + sampleTicksRemaining + " radius=" + sampleRadius
-                            + " interval=" + sampleInterval);
+                    applySampleStart(ticks, radius, interval);
                     reply.accept(ack("sample_start", "ticks=" + sampleTicksRemaining).toString());
                 });
             } else if (upper.startsWith("WAIT ")) {
@@ -166,6 +195,49 @@ public final class InterfaceCore {
 
     private void submit(Runnable task) {
         tasks.offer(task);
+    }
+
+    // ---------------------------------------------------------------- shared state
+    // The socket protocol and the in-game commands drive the same primitives, so
+    // both go through these accessors instead of formatting their own answers.
+
+    public int port() {
+        return server.getPort();
+    }
+
+    public int clientCount() {
+        return server.clientCount();
+    }
+
+    public int tick() {
+        return tickCounter;
+    }
+
+    public boolean isSampling() {
+        return sampling;
+    }
+
+    public long sampleCount() {
+        return sampleIndex;
+    }
+
+    public void applySampleStart(int ticks, double radius, int interval) {
+        sampling = true;
+        sampleTicksRemaining = Math.max(1, ticks);
+        sampleRadius = radius;
+        sampleInterval = Math.max(1, interval);
+        sampleCounter = 0;
+        sampleIndex = 0;
+        emit("sample_start", "ticks=" + sampleTicksRemaining + " radius=" + sampleRadius
+                + " interval=" + sampleInterval);
+    }
+
+    public void applySampleStop() {
+        sampling = false;
+    }
+
+    public void emitMark(String text) {
+        emit("mark", text);
     }
 
     private void scheduleWait(int ticks, Consumer<String> reply) {
@@ -229,7 +301,7 @@ public final class InterfaceCore {
         }
     }
 
-    private JsonObject screenJson() {
+    public JsonObject screenJson() {
         Minecraft client = Minecraft.getInstance();
         JsonObject object = base("screen");
         object.addProperty("tick", tickCounter);
@@ -241,7 +313,7 @@ public final class InterfaceCore {
         return object;
     }
 
-    private JsonObject stateJson() {
+    public JsonObject stateJson() {
         Minecraft client = Minecraft.getInstance();
         JsonObject object = base("state");
         object.addProperty("protocol", InterfaceMod.PROTOCOL_VERSION);
@@ -273,7 +345,7 @@ public final class InterfaceCore {
         return object;
     }
 
-    private JsonObject entitiesJson(double radius) {
+    public JsonObject entitiesJson(double radius) {
         Minecraft client = Minecraft.getInstance();
         JsonObject object = base("entities");
         object.addProperty("tick", tickCounter);
