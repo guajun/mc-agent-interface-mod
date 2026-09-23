@@ -1,5 +1,7 @@
 # mc-agent-interface
 
+📖 Part of **mc-agent**; the guide lives at <https://guajun.github.io/mc-agent/>.
+
 Generic Fabric client mod that exposes a local, versioned interface for agent
 runtimes.
 
