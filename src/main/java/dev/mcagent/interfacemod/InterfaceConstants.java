@@ -28,7 +28,7 @@ public final class InterfaceConstants {
                     + "\"world\",\"lan\",\"events:chat\",\"events:game\"]";
 
     public static final String SERVER_CAPABILITIES =
-            "[\"state\",\"entities\",\"command\",\"context\",\"wait\",\"mark\",\"snapshot\","
+            "[\"state\",\"entities\",\"player\",\"player:view\",\"command\",\"context\",\"wait\",\"mark\",\"snapshot\","
                     + "\"events:game\",\"events:chat\"]";
 
     private InterfaceConstants() {

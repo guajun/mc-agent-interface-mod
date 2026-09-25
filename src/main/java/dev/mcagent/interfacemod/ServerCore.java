@@ -8,6 +8,8 @@ import com.google.gson.JsonParser;
 import net.minecraft.commands.CommandSource;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtUtils;
@@ -17,11 +19,13 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.Mth;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySelector;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.projectile.ProjectileUtil;
-import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.item.component.AttackRange;
 import net.minecraft.world.level.entity.EntityTickList;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.storage.LevelResource;
@@ -62,6 +66,8 @@ import java.util.stream.Stream;
  */
 public final class ServerCore implements LineHandler {
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
+    private static final String[] PLAYER_OPERATIONS =
+            {"PLAYER", "PLAYER_GET", "PLAYER_CONTEXT", "PLAYER_STATE"};
     private static Field tickListField;
 
     private final MinecraftServer server;
@@ -128,7 +134,14 @@ public final class ServerCore implements LineHandler {
         }
         String upper = line.toUpperCase(Locale.ROOT);
         try {
-            if (upper.equals("PING")) {
+            String playerQuery = playerQuery(upper, line);
+            if (playerQuery != null) {
+                if (playerQuery.isEmpty()) {
+                    reply.accept(errorJson("PLAYER needs a player uuid or name").toString());
+                } else {
+                    submit(reply, () -> reply.accept(playerJson(playerQuery).toString()));
+                }
+            } else if (upper.equals("PING")) {
                 reply.accept("{\"type\":\"pong\",\"t\":" + System.currentTimeMillis() + "}");
             } else if (upper.startsWith("ECHO ")) {
                 reply.accept(ack("echo", line.substring(5)).toString());
@@ -338,25 +351,9 @@ public final class ServerCore implements LineHandler {
     private ViewTarget viewTarget(ServerPlayer player) {
         Vec3 eye = player.getEyePosition();
         try {
-            Vec3 look = player.getViewVector(1.0F);
-            double blockRange = player.blockInteractionRange();
-            double entityRange = player.entityInteractionRange();
-
-            Vec3 blockEnd = eye.add(look.scale(blockRange));
-            BlockHitResult blockHit = player.level().clip(new ClipContext(
-                    eye, blockEnd, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
-            double blockDistance = blockHit.getType() == HitResult.Type.MISS
-                    ? blockRange
-                    : eye.distanceTo(blockHit.getLocation());
-
-            double entityLimit = Math.min(entityRange, blockDistance);
-            double entityLimitSq = entityLimit * entityLimit;
-            Vec3 entityEnd = eye.add(look.scale(entityLimit));
-            AABB search = player.getBoundingBox().expandTowards(look.scale(entityLimit)).inflate(1.0D);
-            EntityHitResult entityHit = ProjectileUtil.getEntityHitResult(player, eye, entityEnd, search,
-                    entity -> entity != player && !entity.isSpectator() && entity.isPickable()
-                            && !entity.isRemoved(),
-                    entityLimitSq);
+            HitResult hit = selectViewTarget(player, eye, player.getViewVector(1.0F));
+            EntityHitResult entityHit = hit instanceof EntityHitResult entity ? entity : null;
+            BlockHitResult blockHit = hit instanceof BlockHitResult block ? block : null;
 
             if (entityHit != null) {
                 Vec3 location = entityHit.getLocation();
@@ -367,7 +364,7 @@ public final class ServerCore implements LineHandler {
                         eye.distanceTo(location),
                         new double[] {location.x, location.y, location.z});
             }
-            if (blockHit.getType() == HitResult.Type.BLOCK) {
+            if (blockHit != null && blockHit.getType() == HitResult.Type.BLOCK) {
                 Vec3 location = blockHit.getLocation();
                 BlockPos pos = blockHit.getBlockPos();
                 BlockState state = player.level().getBlockState(pos);
@@ -382,6 +379,219 @@ public final class ServerCore implements LineHandler {
             emitError("context", "view ray failed for " + player.getName().getString() + ": " + throwable);
             return ViewTarget.miss(0.0D);
         }
+    }
+
+    // --------------------------------------------------------------------- players
+
+    /**
+     * One online player's server-known context, plus where they are looking.
+     *
+     * The identifier is a stable UUID first (dashed or plain) and a name second,
+     * so a caller that has the id never has to trust a display name. The view
+     * target is a server-side raycast from the player's own eye and look vector
+     * at request time; the server never asks a client's UI what the crosshair is
+     * over.
+     */
+    private JsonObject playerJson(String query) {
+        JsonObject object = base("player");
+        object.addProperty("instance", "server");
+        object.addProperty("protocol", InterfaceConstants.PROTOCOL_VERSION);
+        object.addProperty("modVersion", InterfaceConstants.VERSION);
+        object.addProperty("tick", server.getTickCount());
+        object.addProperty("query", query);
+
+        UUID uuid = parseUuid(query);
+        ServerPlayer player = uuid == null ? null : server.getPlayerList().getPlayer(uuid);
+        String matchedBy = "uuid";
+        if (player == null) {
+            player = server.getPlayerList().getPlayerByName(query);
+            matchedBy = "name";
+            if (player == null) {
+                for (ServerPlayer online : server.getPlayerList().getPlayers()) {
+                    if (online.getName().getString().equalsIgnoreCase(query)) {
+                        player = online;
+                        break;
+                    }
+                }
+            }
+        }
+        if (player == null) {
+            object.addProperty("found", false);
+            object.addProperty("error", "no online player matches " + query);
+            return object;
+        }
+
+        ServerLevel level = player.level();
+        Vec3 eye = player.getEyePosition(1.0F);
+        Vec3 look = player.getViewVector(1.0F);
+
+        object.addProperty("found", true);
+        object.addProperty("matchedBy", matchedBy);
+        JsonObject info = EntityJson.toJson(player);
+        info.addProperty("dimension", level.dimension().identifier().toString());
+        info.addProperty("gameMode", player.gameMode().getSerializedName());
+        info.add("eye", vector(eye));
+        object.add("player", info);
+
+        JsonObject view = new JsonObject();
+        view.add("eye", vector(eye));
+        view.add("direction", vector(look));
+        view.addProperty("blockRange", player.blockInteractionRange());
+        view.addProperty("entityRange", player.entityInteractionRange());
+        view.add("target", viewTargetJson(player, level, eye, look));
+        object.add("view", view);
+        return object;
+    }
+
+    /**
+     * The server-side equivalent of the crosshair pick. It has the same two
+     * stages as the vanilla 26.2 client: first the active item's attack range
+     * (a spear reaches past the ordinary entity interaction range), then, when
+     * that stage is absent or misses, the ordinary pick with the player's block
+     * and entity interaction ranges. Everything is computed from server-known
+     * state; no client crosshair, camera or screen is read.
+     */
+    private JsonObject viewTargetJson(ServerPlayer player, ServerLevel level, Vec3 eye, Vec3 look) {
+        return targetJson(selectViewTarget(player, eye, look), level, eye);
+    }
+
+    /** Shared target selection for live queries and frozen chat context. */
+    private static HitResult selectViewTarget(ServerPlayer player, Vec3 eye, Vec3 look) {
+        HitResult hit = itemTarget(player, eye);
+        if (hit == null || hit.getType() == HitResult.Type.MISS) {
+            hit = pickTarget(player, eye, look);
+        }
+        return hit;
+    }
+
+    /**
+     * The active item's attack-range stage. Items carrying ATTACK_RANGE (the
+     * spears) select their hit first, and a block hit is still filtered to the
+     * block interaction range, exactly like the client.
+     */
+    private static HitResult itemTarget(ServerPlayer player, Vec3 eye) {
+        AttackRange attackRange = player.getActiveItem().get(DataComponents.ATTACK_RANGE);
+        if (attackRange == null) {
+            return null;
+        }
+        HitResult hit = attackRange.getClosesetHit(player, 1.0F, EntitySelector.CAN_BE_PICKED);
+        if (hit instanceof BlockHitResult) {
+            hit = clampToRange(hit, eye, player.blockInteractionRange());
+        }
+        return hit;
+    }
+
+    /** The ordinary pick used when the item stage is absent or misses. */
+    private static HitResult pickTarget(ServerPlayer player, Vec3 eye, Vec3 look) {
+        double blockRange = player.blockInteractionRange();
+        double entityRange = player.entityInteractionRange();
+        double maxRange = Math.max(blockRange, entityRange);
+        HitResult blockHit = player.pick(maxRange, 1.0F, false);
+        double blockDistanceSq = blockHit.getLocation().distanceToSqr(eye);
+
+        double entityLimit = maxRange;
+        double entityLimitSq = Mth.square(maxRange);
+        if (blockHit.getType() != HitResult.Type.MISS) {
+            entityLimit = Math.sqrt(blockDistanceSq);
+            entityLimitSq = blockDistanceSq;
+        }
+
+        Vec3 end = eye.add(look.scale(entityLimit));
+        AABB search = player.getBoundingBox().expandTowards(look.scale(entityLimit))
+                .inflate(1.0D, 1.0D, 1.0D);
+        EntityHitResult entityHit = ProjectileUtil.getEntityHitResult(
+                player, eye, end, search, EntitySelector.CAN_BE_PICKED, entityLimitSq);
+
+        if (entityHit != null && entityHit.getLocation().distanceToSqr(eye) < blockDistanceSq) {
+            return clampToRange(entityHit, eye, entityRange);
+        }
+        return clampToRange(blockHit, eye, blockRange);
+    }
+
+    /** One hit as JSON: block details, the full entity record, or a miss. */
+    private static JsonObject targetJson(HitResult hit, ServerLevel level, Vec3 eye) {
+        JsonObject target = new JsonObject();
+        target.add("hit", vector(hit.getLocation()));
+        target.addProperty("distance", Math.sqrt(hit.getLocation().distanceToSqr(eye)));
+        if (hit.getType() == HitResult.Type.BLOCK && hit instanceof BlockHitResult block) {
+            BlockPos pos = block.getBlockPos();
+            BlockState state = level.getBlockState(pos);
+            target.addProperty("type", "block");
+            JsonObject info = new JsonObject();
+            info.addProperty("x", pos.getX());
+            info.addProperty("y", pos.getY());
+            info.addProperty("z", pos.getZ());
+            info.addProperty("id", BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
+            info.addProperty("name", state.getBlock().getName().getString());
+            info.addProperty("face", block.getDirection().getName());
+            info.addProperty("inside", block.isInside());
+            target.add("block", info);
+        } else if (hit instanceof EntityHitResult entity) {
+            target.addProperty("type", "entity");
+            target.add("entity", EntityJson.toJson(entity.getEntity()));
+        } else {
+            target.addProperty("type", "miss");
+        }
+        return target;
+    }
+
+    /** The client pick turns an out-of-reach hit into a miss; mirror that. */
+    private static HitResult clampToRange(HitResult hit, Vec3 eye, double range) {
+        Vec3 location = hit.getLocation();
+        if (location.closerThan(eye, range)) {
+            return hit;
+        }
+        Vec3 difference = location.subtract(eye);
+        return BlockHitResult.miss(location,
+                Direction.getApproximateNearest(difference.x, difference.y, difference.z),
+                BlockPos.containing(location));
+    }
+
+    private static UUID parseUuid(String text) {
+        String trimmed = text.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(trimmed);
+        } catch (IllegalArgumentException ignored) {
+            // not a dashed uuid; a plain 32-char form is accepted below
+        }
+        if (trimmed.matches("(?i)[0-9a-f]{32}")) {
+            String dashed = trimmed.substring(0, 8) + "-" + trimmed.substring(8, 12) + "-"
+                    + trimmed.substring(12, 16) + "-" + trimmed.substring(16, 20) + "-"
+                    + trimmed.substring(20);
+            try {
+                return UUID.fromString(dashed);
+            } catch (IllegalArgumentException ignored) {
+                // not a uuid after all
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The argument of a player operation, or null when the line is not one.
+     * Empty means the operation was sent without a player.
+     */
+    private static String playerQuery(String upper, String line) {
+        for (String operation : PLAYER_OPERATIONS) {
+            if (upper.equals(operation)) {
+                return "";
+            }
+            if (upper.startsWith(operation + " ")) {
+                return line.substring(operation.length()).trim();
+            }
+        }
+        return null;
+    }
+
+    private static JsonArray vector(Vec3 vector) {
+        JsonArray array = new JsonArray();
+        array.add(vector.x);
+        array.add(vector.y);
+        array.add(vector.z);
+        return array;
     }
 
     private void runCommand(String command, Consumer<String> reply) {
