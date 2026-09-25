@@ -20,10 +20,12 @@ import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.projectile.ProjectileUtil;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.entity.EntityTickList;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.level.storage.TagValueOutput;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -67,6 +69,7 @@ public final class ServerCore implements LineHandler {
     private final InterfaceServer socket;
     private final ConcurrentLinkedQueue<Wait> waits = new ConcurrentLinkedQueue<>();
     private final PlayerContextCache contexts;
+    private final ChatReceipts receipts;
     private final AtomicLong chatSequence = new AtomicLong();
 
     public ServerCore(MinecraftServer server, Path dir, int basePort) {
@@ -79,6 +82,8 @@ public final class ServerCore implements LineHandler {
         long cacheTtlSeconds = Long.getLong("mcagent.contextCacheTtlSeconds",
                 (long) InterfaceConstants.DEFAULT_CONTEXT_CACHE_TTL_SECONDS);
         this.contexts = new PlayerContextCache(cacheSize, cacheTtlSeconds * 1000L);
+        this.receipts = new ChatReceipts(cacheSize,
+                InterfaceConstants.DEFAULT_RECEIPT_TTL_SECONDS * 1000L);
     }
 
     public void start() {
@@ -234,23 +239,55 @@ public final class ServerCore implements LineHandler {
     // ------------------------------------------------------------------- contexts
 
     /**
-     * Called from the server chat event on the server thread, the instant the
-     * message arrives. The bundle is captured here, synchronously, before any
-     * socket client or agent can delay handling - by the time the event is
-     * written the sender may already have moved on.
-     *
-     * A sender that cannot be resolved (a chat message with no server player)
-     * still produces an event, but one marked as unavailable and without a
-     * context id to fetch.
+     * Called by the network-handler mixin the instant a chat packet is handled,
+     * before the asynchronous filter and before any socket client or agent can
+     * delay it. The bundle is frozen here and parked under the packet identity
+     * until the matching broadcast consumes it.
      */
-    public void onChatMessage(ServerPlayer sender, String text) {
-        long seq = chatSequence.incrementAndGet();
-        PlayerContext context = sender == null ? null : capture(seq, sender);
-        if (context != null) {
-            contexts.put(context, System.currentTimeMillis());
+    public void onChatReceipt(ServerPlayer sender, long salt) {
+        if (sender == null) {
+            return;
         }
+        PlayerContext context = capture(chatSequence.incrementAndGet(), sender);
+        if (context == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        contexts.put(context, now);
+        receipts.put(ChatReceipts.key(sender.getStringUUID(), salt), context.contextId, now);
+    }
+
+    /**
+     * Called from the server chat event when the message is broadcast - after
+     * the asynchronous filter. It consumes the receipt captured when the packet
+     * arrived, so the event describes the sender at receipt time even when
+     * filtering delayed the broadcast. A chat broadcast that did not come
+     * through {@code handleChat} falls back to a broadcast-time capture rather
+     * than losing its context.
+     */
+    public void onChatMessage(ServerPlayer sender, String text, long salt) {
+        long now = System.currentTimeMillis();
+        PlayerContext context = sender == null ? null : receipt(sender, salt, now);
+        if (context == null && sender != null) {
+            context = capture(chatSequence.incrementAndGet(), sender);
+            if (context != null) {
+                contexts.put(context, now);
+            }
+        }
+        long seq = context == null || context.seq == null
+                ? chatSequence.incrementAndGet()
+                : context.seq;
         sink.emit(ContextProtocol.chatEvent(seq, text,
                 sender == null ? null : sender.getName().getString(), context));
+    }
+
+    private PlayerContext receipt(ServerPlayer sender, long salt, long now) {
+        String contextId = receipts.take(ChatReceipts.key(sender.getStringUUID(), salt), now);
+        if (contextId == null) {
+            return null;
+        }
+        PlayerContextCache.Lookup lookup = contexts.get(contextId, now);
+        return lookup.ok() ? lookup.context : null;
     }
 
     private JsonObject contextJson(String contextId) {
@@ -274,34 +311,57 @@ public final class ServerCore implements LineHandler {
     }
 
     /**
-     * The server-side equivalent of the crosshair pick for a captured bundle:
-     * blocks and entities along the player's look vector, using the player's
-     * own interaction ranges and authoritative server state. No client
-     * crosshair, camera or screen is consulted.
+     * The server-side equivalent of the crosshair pick for a captured bundle.
+     *
+     * The block clip uses OUTLINE, not COLLIDER, so targetable blocks without
+     * collision shapes (torches, flowers) are reported instead of being skipped
+     * in favour of the solid block behind them. The ray is built from the
+     * current rotation ({@code getViewVector(1.0F)}), matching the yaw/pitch
+     * stored in the bundle rather than interpolating toward the previous tick.
+     * Entities are compared against the block hit so an entity behind a closer
+     * block is never reported. No client crosshair, camera or screen is read.
      */
     private ViewTarget viewTarget(ServerPlayer player) {
         Vec3 eye = player.getEyePosition();
         try {
-            double range = Math.max(player.blockInteractionRange(), player.entityInteractionRange());
-            HitResult hit = ProjectileUtil.getHitResultOnViewVector(player,
+            Vec3 look = player.getViewVector(1.0F);
+            double blockRange = player.blockInteractionRange();
+            double entityRange = player.entityInteractionRange();
+
+            Vec3 blockEnd = eye.add(look.scale(blockRange));
+            BlockHitResult blockHit = player.level().clip(new ClipContext(
+                    eye, blockEnd, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+            double blockDistance = blockHit.getType() == HitResult.Type.MISS
+                    ? blockRange
+                    : eye.distanceTo(blockHit.getLocation());
+
+            double entityLimit = Math.min(entityRange, blockDistance);
+            double entityLimitSq = entityLimit * entityLimit;
+            Vec3 entityEnd = eye.add(look.scale(entityLimit));
+            AABB search = player.getBoundingBox().expandTowards(look.scale(entityLimit)).inflate(1.0D);
+            EntityHitResult entityHit = ProjectileUtil.getEntityHitResult(player, eye, entityEnd, search,
                     entity -> entity != player && !entity.isSpectator() && entity.isPickable()
                             && !entity.isRemoved(),
-                    range);
-            Vec3 location = hit.getLocation();
-            double distance = eye.distanceTo(location);
-            double[] hitPos = {location.x, location.y, location.z};
-            if (hit.getType() == HitResult.Type.BLOCK && hit instanceof BlockHitResult block) {
-                BlockPos pos = block.getBlockPos();
+                    entityLimitSq);
+
+            if (entityHit != null) {
+                Vec3 location = entityHit.getLocation();
+                Entity target = entityHit.getEntity();
+                return ViewTarget.entity(target.getStringUUID(),
+                        EntityType.getKey(target.getType()).toString(),
+                        target.getName().getString(),
+                        eye.distanceTo(location),
+                        new double[] {location.x, location.y, location.z});
+            }
+            if (blockHit.getType() == HitResult.Type.BLOCK) {
+                Vec3 location = blockHit.getLocation();
+                BlockPos pos = blockHit.getBlockPos();
                 BlockState state = player.level().getBlockState(pos);
                 return ViewTarget.block(BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString(),
                         new int[] {pos.getX(), pos.getY(), pos.getZ()},
-                        block.getDirection().getName(), distance, hitPos);
-            }
-            if (hit instanceof EntityHitResult entity) {
-                Entity target = entity.getEntity();
-                return ViewTarget.entity(target.getStringUUID(),
-                        EntityType.getKey(target.getType()).toString(),
-                        target.getName().getString(), distance, hitPos);
+                        blockHit.getDirection().getName(),
+                        eye.distanceTo(location),
+                        new double[] {location.x, location.y, location.z});
             }
             return ViewTarget.miss(0.0D);
         } catch (Throwable throwable) {

@@ -20,6 +20,8 @@ public final class InterfaceConstants {
     public static final int DEFAULT_CONTEXT_CACHE_SIZE = 256;
     /** How long a chat context bundle stays fetchable after capture. */
     public static final int DEFAULT_CONTEXT_CACHE_TTL_SECONDS = 300;
+    /** How long an unmatched receipt-time capture waits for its broadcast. */
+    public static final int DEFAULT_RECEIPT_TTL_SECONDS = 60;
 
     public static final String CLIENT_CAPABILITIES =
             "[\"state\",\"entities\",\"command\",\"chat\",\"record\",\"wait\",\"screen\",\"mark\",\"connect\","

@@ -25,6 +25,10 @@ public final class InterfaceModTests {
         twoPlayersCorrelateIndependently();
         replyShapesAreStructured();
         statsReportLimits();
+        receiptFreezesTheTransform();
+        receiptsAreSingleUseAndExact();
+        receiptsExpire();
+        receiptsEvictOldestFirst();
         System.out.println("all " + checks + " checks passed");
     }
 
@@ -164,9 +168,80 @@ public final class InterfaceModTests {
         check(cacheObject.get("misses").getAsLong() == 1L, "misses reported");
     }
 
+    /**
+     * Regression for the receipt-vs-broadcast timing: a slow chat filter can
+     * delay the broadcast while the player moves, but the bundle fetched for
+     * the event must still describe the player at packet receipt.
+     */
+    private static void receiptFreezesTheTransform() {
+        PlayerContextCache cache = new PlayerContextCache(4, 60_000L);
+        ChatReceipts receipts = new ChatReceipts(4, 60_000L);
+        String key = ChatReceipts.key("uuid-alice", 4242L);
+
+        // receipt at t=1000, while Alice stands at x=1
+        PlayerContext atReceipt = contextAt(1L, "ctx-alice", 1_000L, "uuid-alice", "Alice", 1.0D);
+        cache.put(atReceipt, 1_000L);
+        receipts.put(key, atReceipt.contextId, 1_000L);
+
+        // the filter is slow; the broadcast arrives at t=9000 and Alice has run to x=50
+        PlayerContext atBroadcast = contextAt(2L, "ctx-late", 9_000L, "uuid-alice", "Alice", 50.0D);
+        String contextId = receipts.take(key, 9_000L);
+        check(atReceipt.contextId.equals(contextId), "the receipt capture is the one correlated");
+
+        PlayerContextCache.Lookup lookup = cache.get(contextId, 9_000L);
+        check(lookup.ok(), "the receipt bundle is still fetchable");
+        check(lookup.context.x == 1.0D, "the bundle describes receipt time, not broadcast time");
+        check(lookup.context.x != atBroadcast.x, "the later transform is never substituted");
+    }
+
+    private static void receiptsAreSingleUseAndExact() {
+        ChatReceipts receipts = new ChatReceipts(4, 60_000L);
+        String key = ChatReceipts.key("uuid-alice", 7L);
+        receipts.put(key, "ctx-alice", 1_000L);
+
+        check("ctx-alice".equals(receipts.take(key, 1_100L)), "the receipt is consumed once");
+        check(receipts.take(key, 1_200L) == null, "a receipt is used at most once");
+        check(receipts.take(ChatReceipts.key("uuid-bob", 7L), 1_200L) == null,
+                "another player's key never matches");
+        check(receipts.take(ChatReceipts.key("uuid-alice", 8L), 1_200L) == null,
+                "another message's salt never matches");
+        check(receipts.matched() == 1L, "matches are counted");
+    }
+
+    private static void receiptsExpire() {
+        ChatReceipts receipts = new ChatReceipts(4, 1_000L);
+        String key = ChatReceipts.key("uuid-alice", 7L);
+        receipts.put(key, "ctx-alice", 10_000L);
+
+        check(receipts.take(key, 11_000L) != null, "an age equal to the ttl still matches");
+        receipts.put(key, "ctx-alice", 20_000L);
+        check(receipts.take(key, 21_001L) == null, "a receipt older than the ttl is dropped");
+        check(receipts.expired() == 1L, "expiry is counted");
+        receipts.put(key, "ctx-bob", 30_000L);
+        check("ctx-bob".equals(receipts.take(key, 30_500L)), "a fresh receipt after expiry matches");
+    }
+
+    private static void receiptsEvictOldestFirst() {
+        ChatReceipts receipts = new ChatReceipts(2, 60_000L);
+        receipts.put(ChatReceipts.key("uuid-a", 1L), "ctx-a", 1_000L);
+        receipts.put(ChatReceipts.key("uuid-b", 2L), "ctx-b", 1_000L);
+        receipts.put(ChatReceipts.key("uuid-c", 3L), "ctx-c", 1_000L);
+
+        check(receipts.size() == 2, "receipt capacity is a hard limit");
+        check(receipts.take(ChatReceipts.key("uuid-a", 1L), 1_100L) == null, "oldest receipt evicted");
+        check("ctx-b".equals(receipts.take(ChatReceipts.key("uuid-b", 2L), 1_100L)), "second kept");
+        check("ctx-c".equals(receipts.take(ChatReceipts.key("uuid-c", 3L), 1_100L)), "newest kept");
+        check(receipts.evicted() == 1L, "eviction is counted");
+    }
+
     private static PlayerContext context(long seq, String id, long capturedAt, String uuid, String name) {
+        return contextAt(seq, id, capturedAt, uuid, name, 1.5D);
+    }
+
+    private static PlayerContext contextAt(long seq, String id, long capturedAt, String uuid, String name,
+                                           double x) {
         return new PlayerContext(seq, id, capturedAt, 42, InterfaceConstants.CONTEXT_SCHEMA, uuid, name,
-                "minecraft:overworld", 1.5D, 64.0D, -2.5D, 90.0F, -10.0F,
+                "minecraft:overworld", x, 64.0D, -2.5D, 90.0F, -10.0F,
                 ViewTarget.block("minecraft:stone", new int[] {10, 63, 0}, "north", 2.5D,
                         new double[] {10.5, 63.5, -0.25}));
     }

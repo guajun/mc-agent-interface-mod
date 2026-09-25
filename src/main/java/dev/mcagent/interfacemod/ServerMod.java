@@ -4,6 +4,7 @@ import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
+import net.minecraft.server.level.ServerPlayer;
 
 import java.nio.file.Path;
 
@@ -37,14 +38,29 @@ public final class ServerMod implements ModInitializer {
                 core.onTick();
             }
         });
-        // Capture the sender's context the moment the server receives a chat
-        // message - not when a socket client or agent eventually reads the event.
+        // Capture the context when the packet is received, not when the chat
+        // is broadcast: Fabric's CHAT_MESSAGE callback runs only after the
+        // asynchronous chat filter, by which time the sender may have moved.
+        // The network-handler mixin parks the receipt; this listener consumes
+        // it and emits the event with the frozen context.
         ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) -> {
             ServerCore current = core;
             if (current != null) {
-                current.onChatMessage(sender, message.signedContent());
+                current.onChatMessage(sender, message.signedContent(), message.salt());
             }
         });
         System.out.println("[mc-agent-interface] server vantage armed, dir=" + dir + " basePort=" + port);
+    }
+
+    /**
+     * Called by the network-handler mixin at the head of chat packet handling,
+     * before the asynchronous filter and chain. Captures the sender's context
+     * now and parks the bundle so the later broadcast can pick it up.
+     */
+    public static void onChatReceipt(ServerPlayer sender, long salt) {
+        ServerCore current = core;
+        if (current != null) {
+            current.onChatReceipt(sender, salt);
+        }
     }
 }

@@ -68,10 +68,13 @@ bare player name.
 
 ### Chat context bundles (server vantage)
 
-The server vantage does not just broadcast chat text. When the server receives
-a chat message it captures the sender's context synchronously - before any
-socket client or agent can delay handling - and stores it under an opaque id.
-The chat event carries that id plus a compact summary:
+The server vantage does not just broadcast chat text. A mixin captures the
+sender's context at the head of chat packet handling - before the asynchronous
+chat filter and before any socket client or agent can delay handling - and
+parks it under the packet's identity. When the broadcast event arrives (even
+seconds later, after filtering) it consumes that receipt, so the bundle always
+describes the sender at packet receipt. The event carries an opaque id plus a
+compact summary:
 
 ```json
 {"type":"chat","millis":...,"event":true,"seq":12,"tick":8451,
@@ -122,10 +125,11 @@ The cache holds at most 256 bundles for 300 seconds by default. When it is full
 the oldest bundle is evicted first; a lookup older than the TTL answers
 `expired` once and `not_found` afterwards, and an expired entry is dropped
 rather than served. Both limits are system properties (see Configuration).
-Bundles contain server-known values only - identity, transform, one view ray,
-schema string - never an entity snapshot or a world save, so the chat event
-stays small. The server `CAPS` advertises `"context"` and `"events:chat"` for
-this.
+Receipt captures that never reach a broadcast are held for at most 60 seconds
+and use the same bound, so they cannot accumulate. Bundles contain server-known
+values only - identity, transform, one view ray, schema string - never an
+entity snapshot or a world save, so the chat event stays small. The server
+`CAPS` advertises `"context"` and `"events:chat"` for this.
 
 Entity records for players carry `name` (and `gameMode`), because a client
 cannot otherwise tell one player from another - and a Carpet fake player is
