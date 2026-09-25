@@ -180,26 +180,29 @@ public final class InterfaceModTests {
 
         // receipt at t=1000, while Alice stands at x=1
         PlayerContext atReceipt = contextAt(1L, "ctx-alice", 1_000L, "uuid-alice", "Alice", 1.0D);
-        cache.put(atReceipt, 1_000L);
-        receipts.put(key, atReceipt.contextId, 1_000L);
+        receipts.put(key, atReceipt, 1_000L);
 
         // the filter is slow; the broadcast arrives at t=9000 and Alice has run to x=50
         PlayerContext atBroadcast = contextAt(2L, "ctx-late", 9_000L, "uuid-alice", "Alice", 50.0D);
-        String contextId = receipts.take(key, 9_000L);
-        check(atReceipt.contextId.equals(contextId), "the receipt capture is the one correlated");
+        PlayerContext published = receipts.take(key, 9_000L);
+        check(published == atReceipt, "the receipt capture is the one correlated");
+        check(published.x == 1.0D, "the bundle describes receipt time, not broadcast time");
+        check(published.x != atBroadcast.x, "the later transform is never substituted");
 
-        PlayerContextCache.Lookup lookup = cache.get(contextId, 9_000L);
-        check(lookup.ok(), "the receipt bundle is still fetchable");
-        check(lookup.context.x == 1.0D, "the bundle describes receipt time, not broadcast time");
-        check(lookup.context.x != atBroadcast.x, "the later transform is never substituted");
+        // onChatMessage publishes the consumed receipt under the same id
+        cache.put(published, 9_000L);
+        PlayerContextCache.Lookup lookup = cache.get(published.contextId, 9_000L);
+        check(lookup.ok(), "the receipt bundle is fetchable after the broadcast");
+        check(lookup.context.x == 1.0D, "the published bundle keeps the receipt-time transform");
     }
 
     private static void receiptsAreSingleUseAndExact() {
         ChatReceipts receipts = new ChatReceipts(4, 60_000L);
         String key = ChatReceipts.key("uuid-alice", 7L);
-        receipts.put(key, "ctx-alice", 1_000L);
+        receipts.put(key, context(1L, "ctx-alice", 1_000L, "uuid-alice", "Alice"), 1_000L);
 
-        check("ctx-alice".equals(receipts.take(key, 1_100L)), "the receipt is consumed once");
+        PlayerContext taken = receipts.take(key, 1_100L);
+        check(taken != null && "ctx-alice".equals(taken.contextId), "the receipt is consumed once");
         check(receipts.take(key, 1_200L) == null, "a receipt is used at most once");
         check(receipts.take(ChatReceipts.key("uuid-bob", 7L), 1_200L) == null,
                 "another player's key never matches");
@@ -211,26 +214,29 @@ public final class InterfaceModTests {
     private static void receiptsExpire() {
         ChatReceipts receipts = new ChatReceipts(4, 1_000L);
         String key = ChatReceipts.key("uuid-alice", 7L);
-        receipts.put(key, "ctx-alice", 10_000L);
+        receipts.put(key, context(1L, "ctx-alice", 10_000L, "uuid-alice", "Alice"), 10_000L);
 
         check(receipts.take(key, 11_000L) != null, "an age equal to the ttl still matches");
-        receipts.put(key, "ctx-alice", 20_000L);
+        receipts.put(key, context(2L, "ctx-alice", 20_000L, "uuid-alice", "Alice"), 20_000L);
         check(receipts.take(key, 21_001L) == null, "a receipt older than the ttl is dropped");
         check(receipts.expired() == 1L, "expiry is counted");
-        receipts.put(key, "ctx-bob", 30_000L);
-        check("ctx-bob".equals(receipts.take(key, 30_500L)), "a fresh receipt after expiry matches");
+        receipts.put(key, context(3L, "ctx-bob", 30_000L, "uuid-bob", "Bob"), 30_000L);
+        PlayerContext fresh = receipts.take(key, 30_500L);
+        check(fresh != null && "ctx-bob".equals(fresh.contextId), "a fresh receipt after expiry matches");
     }
 
     private static void receiptsEvictOldestFirst() {
         ChatReceipts receipts = new ChatReceipts(2, 60_000L);
-        receipts.put(ChatReceipts.key("uuid-a", 1L), "ctx-a", 1_000L);
-        receipts.put(ChatReceipts.key("uuid-b", 2L), "ctx-b", 1_000L);
-        receipts.put(ChatReceipts.key("uuid-c", 3L), "ctx-c", 1_000L);
+        receipts.put(ChatReceipts.key("uuid-a", 1L), context(1L, "ctx-a", 1_000L, "uuid-a", "A"), 1_000L);
+        receipts.put(ChatReceipts.key("uuid-b", 2L), context(2L, "ctx-b", 1_000L, "uuid-b", "B"), 1_000L);
+        receipts.put(ChatReceipts.key("uuid-c", 3L), context(3L, "ctx-c", 1_000L, "uuid-c", "C"), 1_000L);
 
         check(receipts.size() == 2, "receipt capacity is a hard limit");
         check(receipts.take(ChatReceipts.key("uuid-a", 1L), 1_100L) == null, "oldest receipt evicted");
-        check("ctx-b".equals(receipts.take(ChatReceipts.key("uuid-b", 2L), 1_100L)), "second kept");
-        check("ctx-c".equals(receipts.take(ChatReceipts.key("uuid-c", 3L), 1_100L)), "newest kept");
+        PlayerContext b = receipts.take(ChatReceipts.key("uuid-b", 2L), 1_100L);
+        check(b != null && "ctx-b".equals(b.contextId), "second kept");
+        PlayerContext c = receipts.take(ChatReceipts.key("uuid-c", 3L), 1_100L);
+        check(c != null && "ctx-c".equals(c.contextId), "newest kept");
         check(receipts.evicted() == 1L, "eviction is counted");
     }
 

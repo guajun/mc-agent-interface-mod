@@ -126,7 +126,8 @@ the oldest bundle is evicted first; a lookup older than the TTL answers
 `expired` once and `not_found` afterwards, and an expired entry is dropped
 rather than served. Both limits are system properties (see Configuration).
 Receipt captures that never reach a broadcast are held for at most 60 seconds
-and use the same bound, so they cannot accumulate. Bundles contain server-known
+and use the same bound; only a bundle that was actually broadcast enters the
+cache, so junk packets cannot evict live context. Bundles contain server-known
 values only - identity, transform, one view ray, schema string - never an
 entity snapshot or a world save, so the chat event stays small. The server
 `CAPS` advertises `"context"` and `"events:chat"` for this.

@@ -10,15 +10,16 @@ import java.util.Map;
  * A chat packet is captured when the network handler first sees it, but the
  * matching broadcast event fires only after the asynchronous chat filter has
  * finished. Between those two points the sender may move or turn, so the
- * capture is parked here under the packet's identity and consumed by the
- * broadcast listener - the bundle behind the returned id was frozen at
- * receipt, never at broadcast.
+ * frozen bundle is parked here under the packet's identity and consumed by the
+ * broadcast listener - the published bundle describes receipt time, never
+ * broadcast time.
  *
  * Like the context cache, this store is bounded and expiring: a receipt whose
  * broadcast never arrives (invalid packet, cancelled message, mod broadcast)
  * is dropped after {@code ttlMillis} and the oldest entries are evicted first.
- * Lookups are by exact key, so a mismatched message can never consume another
- * player's receipt.
+ * Only consumed receipts are published to the context cache, so junk packets
+ * cannot evict live bundles. Lookups are by exact key, so a mismatched message
+ * can never consume another player's receipt.
  */
 public final class ChatReceipts {
     private final int capacity;
@@ -38,7 +39,7 @@ public final class ChatReceipts {
         return senderUuid + ":" + salt;
     }
 
-    public synchronized void put(String key, String contextId, long nowMillis) {
+    public synchronized void put(String key, PlayerContext context, long nowMillis) {
         purgeExpired(nowMillis);
         while (entries.size() >= capacity) {
             Iterator<Map.Entry<String, Entry>> iterator = entries.entrySet().iterator();
@@ -49,15 +50,15 @@ public final class ChatReceipts {
             iterator.remove();
             evicted++;
         }
-        entries.put(key, new Entry(contextId, nowMillis));
+        entries.put(key, new Entry(context, nowMillis));
     }
 
     /**
-     * Consume the capture for one message, or null when there is none (a
-     * broadcast that never passed through the network handler) or when it has
-     * expired. One receipt is used at most once.
+     * Consume the frozen capture for one message, or null when there is none
+     * (a broadcast that never passed through the network handler) or when it
+     * has expired. One receipt is used at most once.
      */
-    public synchronized String take(String key, long nowMillis) {
+    public synchronized PlayerContext take(String key, long nowMillis) {
         Entry entry = entries.remove(key);
         if (entry == null) {
             return null;
@@ -67,7 +68,7 @@ public final class ChatReceipts {
             return null;
         }
         matched++;
-        return entry.contextId;
+        return entry.context;
     }
 
     private void purgeExpired(long nowMillis) {
@@ -98,11 +99,11 @@ public final class ChatReceipts {
     }
 
     private static final class Entry {
-        private final String contextId;
+        private final PlayerContext context;
         private final long receivedAtMillis;
 
-        private Entry(String contextId, long receivedAtMillis) {
-            this.contextId = contextId;
+        private Entry(PlayerContext context, long receivedAtMillis) {
+            this.context = context;
             this.receivedAtMillis = receivedAtMillis;
         }
     }

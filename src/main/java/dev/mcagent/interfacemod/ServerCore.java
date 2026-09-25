@@ -249,45 +249,36 @@ public final class ServerCore implements LineHandler {
             return;
         }
         PlayerContext context = capture(chatSequence.incrementAndGet(), sender);
-        if (context == null) {
-            return;
+        if (context != null) {
+            receipts.put(ChatReceipts.key(sender.getStringUUID(), salt), context,
+                    System.currentTimeMillis());
         }
-        long now = System.currentTimeMillis();
-        contexts.put(context, now);
-        receipts.put(ChatReceipts.key(sender.getStringUUID(), salt), context.contextId, now);
     }
 
     /**
      * Called from the server chat event when the message is broadcast - after
      * the asynchronous filter. It consumes the receipt captured when the packet
-     * arrived, so the event describes the sender at receipt time even when
-     * filtering delayed the broadcast. A chat broadcast that did not come
-     * through {@code handleChat} falls back to a broadcast-time capture rather
-     * than losing its context.
+     * arrived and publishes it, so the event and the fetchable bundle describe
+     * the sender at receipt time even when filtering delayed the broadcast. A
+     * chat broadcast that did not come through {@code handleChat} falls back to
+     * a broadcast-time capture rather than losing its context.
      */
     public void onChatMessage(ServerPlayer sender, String text, long salt) {
         long now = System.currentTimeMillis();
-        PlayerContext context = sender == null ? null : receipt(sender, salt, now);
+        PlayerContext context = sender == null
+                ? null
+                : receipts.take(ChatReceipts.key(sender.getStringUUID(), salt), now);
         if (context == null && sender != null) {
             context = capture(chatSequence.incrementAndGet(), sender);
-            if (context != null) {
-                contexts.put(context, now);
-            }
+        }
+        if (context != null) {
+            contexts.put(context, now);
         }
         long seq = context == null || context.seq == null
                 ? chatSequence.incrementAndGet()
                 : context.seq;
         sink.emit(ContextProtocol.chatEvent(seq, text,
                 sender == null ? null : sender.getName().getString(), context));
-    }
-
-    private PlayerContext receipt(ServerPlayer sender, long salt, long now) {
-        String contextId = receipts.take(ChatReceipts.key(sender.getStringUUID(), salt), now);
-        if (contextId == null) {
-            return null;
-        }
-        PlayerContextCache.Lookup lookup = contexts.get(contextId, now);
-        return lookup.ok() ? lookup.context : null;
     }
 
     private JsonObject contextJson(String contextId) {
