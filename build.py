@@ -50,6 +50,23 @@ def version_key(path):
     return numbers or [0]
 
 
+def maven_jar_path(libraries, name):
+    """Resolve a Maven coordinate to its jar under <minecraft-dir>/libraries.
+
+    Fabric profile libraries (fabric-loader, sponge-mixin, ASM) often carry no
+    downloads.artifact because the launcher resolves them from the maven
+    repository. Compiling mixin annotations needs sponge-mixin, so fall back to
+    the coordinate when the profile has no downloaded path.
+    """
+    parts = name.split(":")
+    if len(parts) < 3:
+        return None
+    group, artifact, version = parts[0], parts[1], parts[2]
+    classifier = f"-{parts[3]}" if len(parts) > 3 else ""
+    return libraries.joinpath(*group.split("."), artifact, version,
+                              f"{artifact}-{version}{classifier}.jar")
+
+
 def build_classpath(minecraft_dir, version):
     version_dir = minecraft_dir / "versions" / version
     version_json = version_dir / f"{version}.json"
@@ -74,6 +91,12 @@ def build_classpath(minecraft_dir, version):
         path = artifact.get("path")
         if path:
             add(libraries / path)
+            continue
+        name = library.get("name")
+        if name:
+            fallback = maven_jar_path(libraries, name)
+            if fallback is not None:
+                add(fallback)
 
     loader_jars = sorted(
         (libraries / "net" / "fabricmc" / "fabric-loader").glob("*/fabric-loader-*.jar")

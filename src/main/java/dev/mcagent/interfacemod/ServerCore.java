@@ -14,6 +14,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtUtils;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.PlayerChatMessage;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -49,6 +50,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -73,12 +75,22 @@ public final class ServerCore implements LineHandler {
     private final EventSink sink;
     private final InterfaceServer socket;
     private final ConcurrentLinkedQueue<Wait> waits = new ConcurrentLinkedQueue<>();
+    private final PlayerContextCache contexts;
+    private final ChatReceipts receipts;
+    private final AtomicLong chatSequence = new AtomicLong();
 
     public ServerCore(MinecraftServer server, Path dir, int basePort) {
         this.server = server;
         this.dir = dir;
         this.sink = new EventSink(dir);
         this.socket = new InterfaceServer(basePort, this, "server", InterfaceConstants.SERVER_CAPABILITIES);
+        int cacheSize = Integer.getInteger("mcagent.contextCacheSize",
+                InterfaceConstants.DEFAULT_CONTEXT_CACHE_SIZE);
+        long cacheTtlSeconds = Long.getLong("mcagent.contextCacheTtlSeconds",
+                (long) InterfaceConstants.DEFAULT_CONTEXT_CACHE_TTL_SECONDS);
+        this.contexts = new PlayerContextCache(cacheSize, cacheTtlSeconds * 1000L);
+        this.receipts = new ChatReceipts(cacheSize,
+                InterfaceConstants.DEFAULT_RECEIPT_TTL_SECONDS * 1000L);
     }
 
     public void start() {
@@ -135,6 +147,14 @@ public final class ServerCore implements LineHandler {
                 reply.accept(ack("echo", line.substring(5)).toString());
             } else if (upper.equals("CAPS") || upper.equals("CAPABILITIES") || upper.equals("CAPS_GET")) {
                 reply.accept(capabilitiesJson().toString());
+            } else if (upper.equals("CONTEXT") || upper.equals("CONTEXT_STATS") || upper.equals("CONTEXT_STATS_GET")) {
+                reply.accept(ContextProtocol.statsReply(contexts).toString());
+            } else if (upper.startsWith("CONTEXT_GET ")) {
+                String contextId = line.substring(12).trim();
+                submit(reply, () -> reply.accept(contextJson(contextId).toString()));
+            } else if (upper.startsWith("CONTEXT ")) {
+                String contextId = line.substring(8).trim();
+                submit(reply, () -> reply.accept(contextJson(contextId).toString()));
             } else if (upper.equals("STATE") || upper.equals("STATE_GET")) {
                 submit(reply, () -> reply.accept(stateJson().toString()));
             } else if (upper.equals("ENTITIES") || upper.equals("ENTITY_LIST")) {
@@ -230,6 +250,137 @@ public final class ServerCore implements LineHandler {
         return object;
     }
 
+    // ------------------------------------------------------------------- contexts
+
+    /**
+     * Called by the network-handler mixin the instant a chat packet is handled,
+     * before the asynchronous filter and before any socket client or agent can
+     * delay it. The bundle is frozen here and parked under the packet identity
+     * until the matching broadcast consumes it.
+     */
+    public void onChatReceipt(ServerPlayer sender, PlayerChatMessage message) {
+        if (sender == null || message == null) {
+            return;
+        }
+        PlayerContext context = capture(chatSequence.incrementAndGet(), sender, PlayerContext.RECEIPT);
+        if (context != null) {
+            receipts.put(receiptKey(message), context, System.currentTimeMillis());
+        }
+    }
+
+    /**
+     * Called from the server chat event when the message is broadcast - after
+     * the asynchronous filter. It consumes the receipt frozen on the server
+     * thread before filtering and publishes it, so the event and the fetchable
+     * bundle describe the sender at receipt time. An expired receipt is reported
+     * as such instead of substituting live state; when there was no receipt at
+     * all (a broadcast that did not come through {@code handleChat}, or one
+     * evicted under capacity pressure) the capture is labelled
+     * {@link PlayerContext#BROADCAST} so callers can tell it apart.
+     */
+    public void onChatMessage(ServerPlayer sender, PlayerChatMessage message) {
+        long now = System.currentTimeMillis();
+        String text = message == null ? "" : message.signedContent();
+        String senderName = sender == null ? null : sender.getName().getString();
+        if (sender == null || message == null) {
+            sink.emit(ContextProtocol.chatEvent(chatSequence.incrementAndGet(), text, senderName, null));
+            return;
+        }
+
+        ChatReceipts.Lookup lookup = receipts.take(receiptKey(message), now);
+        PlayerContext fallback = null;
+        long seq;
+        if (lookup.status == ChatReceipts.Status.OK) {
+            seq = lookup.context.seq == null ? chatSequence.incrementAndGet() : lookup.context.seq;
+            contexts.put(lookup.context, now);
+        } else if (lookup.status == ChatReceipts.Status.EXPIRED) {
+            seq = chatSequence.incrementAndGet();
+        } else {
+            long fallbackSeq = chatSequence.incrementAndGet();
+            fallback = capture(fallbackSeq, sender, PlayerContext.BROADCAST);
+            if (fallback != null) {
+                contexts.put(fallback, now);
+            }
+            seq = fallbackSeq;
+        }
+        sink.emit(ContextProtocol.chatEvent(seq, text, senderName, lookup, fallback));
+    }
+
+    /**
+     * Identity that survives chat decoding and filtering: the link, signature
+     * and signed body are the same on the message built by getSignedMessage and
+     * on the filtered message that reaches the broadcast event. In particular
+     * it does not depend on the packet salt, which an unsigned decode replaces
+     * with 0.
+     */
+    static String receiptKey(PlayerChatMessage message) {
+        return message.link() + "|" + message.signature() + "|" + message.signedBody();
+    }
+
+    private JsonObject contextJson(String contextId) {
+        PlayerContextCache.Lookup lookup = contexts.get(contextId, System.currentTimeMillis());
+        return ContextProtocol.contextReply(contextId, lookup, contexts);
+    }
+
+    private PlayerContext capture(Long seq, ServerPlayer player, String timing) {
+        try {
+            ServerLevel level = player.level();
+            return new PlayerContext(seq, "ctx-" + UUID.randomUUID(), System.currentTimeMillis(),
+                    server.getTickCount(), InterfaceConstants.CONTEXT_SCHEMA, timing,
+                    player.getStringUUID(), player.getName().getString(),
+                    level.dimension().identifier().toString(),
+                    player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot(),
+                    viewTarget(player));
+        } catch (Throwable throwable) {
+            emitError("context", "capture failed for " + player.getName().getString() + ": " + throwable);
+            return null;
+        }
+    }
+
+    /**
+     * The server-side equivalent of the crosshair pick for a captured bundle.
+     *
+     * The block clip uses OUTLINE, not COLLIDER, so targetable blocks without
+     * collision shapes (torches, flowers) are reported instead of being skipped
+     * in favour of the solid block behind them. The ray is built from the
+     * current rotation ({@code getViewVector(1.0F)}), matching the yaw/pitch
+     * stored in the bundle rather than interpolating toward the previous tick.
+     * Entities are compared against the block hit so an entity behind a closer
+     * block is never reported. No client crosshair, camera or screen is read.
+     */
+    private ViewTarget viewTarget(ServerPlayer player) {
+        Vec3 eye = player.getEyePosition();
+        try {
+            HitResult hit = selectViewTarget(player, eye, player.getViewVector(1.0F));
+            EntityHitResult entityHit = hit instanceof EntityHitResult entity ? entity : null;
+            BlockHitResult blockHit = hit instanceof BlockHitResult block ? block : null;
+
+            if (entityHit != null) {
+                Vec3 location = entityHit.getLocation();
+                Entity target = entityHit.getEntity();
+                return ViewTarget.entity(target.getStringUUID(),
+                        EntityType.getKey(target.getType()).toString(),
+                        target.getName().getString(),
+                        eye.distanceTo(location),
+                        new double[] {location.x, location.y, location.z});
+            }
+            if (blockHit != null && blockHit.getType() == HitResult.Type.BLOCK) {
+                Vec3 location = blockHit.getLocation();
+                BlockPos pos = blockHit.getBlockPos();
+                BlockState state = player.level().getBlockState(pos);
+                return ViewTarget.block(BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString(),
+                        new int[] {pos.getX(), pos.getY(), pos.getZ()},
+                        blockHit.getDirection().getName(),
+                        eye.distanceTo(location),
+                        new double[] {location.x, location.y, location.z});
+            }
+            return ViewTarget.miss(0.0D);
+        } catch (Throwable throwable) {
+            emitError("context", "view ray failed for " + player.getName().getString() + ": " + throwable);
+            return ViewTarget.miss(0.0D);
+        }
+    }
+
     // --------------------------------------------------------------------- players
 
     /**
@@ -301,11 +452,16 @@ public final class ServerCore implements LineHandler {
      * state; no client crosshair, camera or screen is read.
      */
     private JsonObject viewTargetJson(ServerPlayer player, ServerLevel level, Vec3 eye, Vec3 look) {
+        return targetJson(selectViewTarget(player, eye, look), level, eye);
+    }
+
+    /** Shared target selection for live queries and frozen chat context. */
+    private static HitResult selectViewTarget(ServerPlayer player, Vec3 eye, Vec3 look) {
         HitResult hit = itemTarget(player, eye);
         if (hit == null || hit.getType() == HitResult.Type.MISS) {
             hit = pickTarget(player, eye, look);
         }
-        return targetJson(hit, level, eye);
+        return hit;
     }
 
     /**
