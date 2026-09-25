@@ -7,6 +7,8 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.commands.CommandSource;
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtUtils;
 import net.minecraft.network.chat.Component;
@@ -17,9 +19,15 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.projectile.ProjectileUtil;
 import net.minecraft.world.level.entity.EntityTickList;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.level.storage.TagValueOutput;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -33,7 +41,9 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -56,12 +66,19 @@ public final class ServerCore implements LineHandler {
     private final EventSink sink;
     private final InterfaceServer socket;
     private final ConcurrentLinkedQueue<Wait> waits = new ConcurrentLinkedQueue<>();
+    private final PlayerContextCache contexts;
+    private final AtomicLong chatSequence = new AtomicLong();
 
     public ServerCore(MinecraftServer server, Path dir, int basePort) {
         this.server = server;
         this.dir = dir;
         this.sink = new EventSink(dir);
         this.socket = new InterfaceServer(basePort, this, "server", InterfaceConstants.SERVER_CAPABILITIES);
+        int cacheSize = Integer.getInteger("mcagent.contextCacheSize",
+                InterfaceConstants.DEFAULT_CONTEXT_CACHE_SIZE);
+        long cacheTtlSeconds = Long.getLong("mcagent.contextCacheTtlSeconds",
+                (long) InterfaceConstants.DEFAULT_CONTEXT_CACHE_TTL_SECONDS);
+        this.contexts = new PlayerContextCache(cacheSize, cacheTtlSeconds * 1000L);
     }
 
     public void start() {
@@ -111,6 +128,14 @@ public final class ServerCore implements LineHandler {
                 reply.accept(ack("echo", line.substring(5)).toString());
             } else if (upper.equals("CAPS") || upper.equals("CAPABILITIES") || upper.equals("CAPS_GET")) {
                 reply.accept(capabilitiesJson().toString());
+            } else if (upper.equals("CONTEXT") || upper.equals("CONTEXT_STATS") || upper.equals("CONTEXT_STATS_GET")) {
+                reply.accept(ContextProtocol.statsReply(contexts).toString());
+            } else if (upper.startsWith("CONTEXT_GET ")) {
+                String contextId = line.substring(12).trim();
+                submit(reply, () -> reply.accept(contextJson(contextId).toString()));
+            } else if (upper.startsWith("CONTEXT ")) {
+                String contextId = line.substring(8).trim();
+                submit(reply, () -> reply.accept(contextJson(contextId).toString()));
             } else if (upper.equals("STATE") || upper.equals("STATE_GET")) {
                 submit(reply, () -> reply.accept(stateJson().toString()));
             } else if (upper.equals("ENTITIES") || upper.equals("ENTITY_LIST")) {
@@ -204,6 +229,85 @@ public final class ServerCore implements LineHandler {
         object.addProperty("instance", "server");
         object.add("capabilities", JsonParser.parseString(InterfaceConstants.SERVER_CAPABILITIES));
         return object;
+    }
+
+    // ------------------------------------------------------------------- contexts
+
+    /**
+     * Called from the server chat event on the server thread, the instant the
+     * message arrives. The bundle is captured here, synchronously, before any
+     * socket client or agent can delay handling - by the time the event is
+     * written the sender may already have moved on.
+     *
+     * A sender that cannot be resolved (a chat message with no server player)
+     * still produces an event, but one marked as unavailable and without a
+     * context id to fetch.
+     */
+    public void onChatMessage(ServerPlayer sender, String text) {
+        long seq = chatSequence.incrementAndGet();
+        PlayerContext context = sender == null ? null : capture(seq, sender);
+        if (context != null) {
+            contexts.put(context, System.currentTimeMillis());
+        }
+        sink.emit(ContextProtocol.chatEvent(seq, text,
+                sender == null ? null : sender.getName().getString(), context));
+    }
+
+    private JsonObject contextJson(String contextId) {
+        PlayerContextCache.Lookup lookup = contexts.get(contextId, System.currentTimeMillis());
+        return ContextProtocol.contextReply(contextId, lookup, contexts);
+    }
+
+    private PlayerContext capture(Long seq, ServerPlayer player) {
+        try {
+            ServerLevel level = player.level();
+            return new PlayerContext(seq, "ctx-" + UUID.randomUUID(), System.currentTimeMillis(),
+                    server.getTickCount(), InterfaceConstants.CONTEXT_SCHEMA,
+                    player.getStringUUID(), player.getName().getString(),
+                    level.dimension().identifier().toString(),
+                    player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot(),
+                    viewTarget(player));
+        } catch (Throwable throwable) {
+            emitError("context", "capture failed for " + player.getName().getString() + ": " + throwable);
+            return null;
+        }
+    }
+
+    /**
+     * The server-side equivalent of the crosshair pick for a captured bundle:
+     * blocks and entities along the player's look vector, using the player's
+     * own interaction ranges and authoritative server state. No client
+     * crosshair, camera or screen is consulted.
+     */
+    private ViewTarget viewTarget(ServerPlayer player) {
+        Vec3 eye = player.getEyePosition();
+        try {
+            double range = Math.max(player.blockInteractionRange(), player.entityInteractionRange());
+            HitResult hit = ProjectileUtil.getHitResultOnViewVector(player,
+                    entity -> entity != player && !entity.isSpectator() && entity.isPickable()
+                            && !entity.isRemoved(),
+                    range);
+            Vec3 location = hit.getLocation();
+            double distance = eye.distanceTo(location);
+            double[] hitPos = {location.x, location.y, location.z};
+            if (hit.getType() == HitResult.Type.BLOCK && hit instanceof BlockHitResult block) {
+                BlockPos pos = block.getBlockPos();
+                BlockState state = player.level().getBlockState(pos);
+                return ViewTarget.block(BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString(),
+                        new int[] {pos.getX(), pos.getY(), pos.getZ()},
+                        block.getDirection().getName(), distance, hitPos);
+            }
+            if (hit instanceof EntityHitResult entity) {
+                Entity target = entity.getEntity();
+                return ViewTarget.entity(target.getStringUUID(),
+                        EntityType.getKey(target.getType()).toString(),
+                        target.getName().getString(), distance, hitPos);
+            }
+            return ViewTarget.miss(0.0D);
+        } catch (Throwable throwable) {
+            emitError("context", "view ray failed for " + player.getName().getString() + ": " + throwable);
+            return ViewTarget.miss(0.0D);
+        }
     }
 
     private void runCommand(String command, Consumer<String> reply) {

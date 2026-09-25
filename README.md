@@ -19,7 +19,7 @@ Messages are UTF-8 text, one JSON object per line.
 On connect the mod sends:
 
 ```json
-{"type":"hello","mod":"mc-agent-interface","version":"0.1.0","protocol":1,
+{"type":"hello","mod":"mc-agent-interface","version":"0.6.0","protocol":1,
  "minecraft":"26.2","port":25580,
  "capabilities":["state","entities","command","chat","record","wait","screen",
                   "mark","connect","events:chat","events:game"]}
@@ -66,6 +66,67 @@ shift every later answer by one).
 component, so clients should extract the name defensively rather than assume a
 bare player name.
 
+### Chat context bundles (server vantage)
+
+The server vantage does not just broadcast chat text. When the server receives
+a chat message it captures the sender's context synchronously - before any
+socket client or agent can delay handling - and stores it under an opaque id.
+The chat event carries that id plus a compact summary:
+
+```json
+{"type":"chat","millis":...,"event":true,"seq":12,"tick":8451,
+ "text":"hello","sender":"Notch","context_id":"ctx-2b1d...",
+ "context":{"schema":"player-context/1","uuid":"069a79f4-...","name":"Notch",
+            "tick":8451,"dimension":"minecraft:overworld",
+            "x":10.5,"y":64.0,"z":-3.25,"yaw":180.0,"pitch":12.5,
+            "view":{"type":"block"}}}
+```
+
+The bundle behind the id is the event-time context plus the full view ray - the
+server-side pick along the sender's eye line, computed from authoritative
+state, never from a client crosshair:
+
+```json
+{"view":{"type":"block","distance":3.1,"block":"minecraft:stone",
+         "pos":[10,63,0],"face":"north","hit":[10.5,63.5,-0.25]}}
+```
+
+The server vantage answers `CONTEXT` requests for it:
+
+| Request | Meaning |
+| --- | --- |
+| `CONTEXT <context_id>` | fetch the captured bundle by id |
+| `CONTEXT` | cache stats: capacity, ttlMillis, size, hits, misses, expired, evicted |
+
+```json
+{"type":"context","millis":...,"status":"ok","context_id":"ctx-2b1d...",
+ "ageMillis":842,"cache":{"capacity":256,"ttlMillis":300000,"size":3},
+ "context":{"schema":"player-context/1","context_id":"ctx-2b1d...","seq":12,
+            "capturedAt":1790343000000,"tick":8451,"uuid":"069a79f4-...",
+            "name":"Notch","dimension":"minecraft:overworld","x":10.5,"y":64.0,
+            "z":-3.25,"yaw":180.0,"pitch":12.5,
+            "view":{"type":"block","distance":3.1,"block":"minecraft:stone",
+                    "pos":[10,63,0],"face":"north","hit":[10.5,63.5,-0.25]}}}
+```
+
+Unknown and expired ids are structured and never return a different player's
+context:
+
+```json
+{"type":"context","status":"not_found","context_id":"ctx-nope","cache":{...}}
+{"type":"context","status":"expired","context_id":"ctx-2b1d...","capturedAt":1790343000000,
+ "ageMillis":4200000,"cache":{...}}
+```
+
+The cache holds at most 256 bundles for 300 seconds by default. When it is full
+the oldest bundle is evicted first; a lookup older than the TTL answers
+`expired` once and `not_found` afterwards, and an expired entry is dropped
+rather than served. Both limits are system properties (see Configuration).
+Bundles contain server-known values only - identity, transform, one view ray,
+schema string - never an entity snapshot or a world save, so the chat event
+stays small. The server `CAPS` advertises `"context"` and `"events:chat"` for
+this.
+
 Entity records for players carry `name` (and `gameMode`), because a client
 cannot otherwise tell one player from another - and a Carpet fake player is
 just a player entity as far as the client is concerned.
@@ -84,8 +145,22 @@ python build.py \
   --jdk "C:/Program Files/Java/jdk-25"
 ```
 
-Output: `dist/mc-agent-interface-0.1.0.jar`. Put it together with
+Output: `dist/mc-agent-interface-0.6.0.jar`. Put it together with
 `fabric-api-*.jar` into the client's `mods/` directory.
+
+## Tests
+
+`test.py` compiles the mod and runs the dependency-free unit tests for the chat
+context cache and protocol shapes - capture/correlation, deterministic
+eviction, expiry, unknown ids and unavailable senders. It takes the same
+`--minecraft-dir`, `--version` and `--jdk` arguments as `build.py`:
+
+```bash
+python test.py \
+  --minecraft-dir "C:/Users/me/AppData/Roaming/.minecraft" \
+  --version 26.2-Fabric \
+  --jdk "C:/Program Files/Java/jdk-25"
+```
 
 ## Configuration
 
@@ -94,6 +169,10 @@ Output: `dist/mc-agent-interface-0.1.0.jar`. Put it together with
 | `mcagent.dir` | `<gameDir>/mc-agent` | directory for `port.txt`, event and sample files |
 | `mcagent.port` | `25580` | first port to try; the mod falls back to the next free port |
 | `mcagent.autoConnect` | unset | `host:port`; join that server from the title screen on startup |
+| `mcagent.serverDir` | `mc-agent-server` | server vantage: directory for `port.txt`, event and snapshot files |
+| `mcagent.serverPort` | `25581` | server vantage: first port to try |
+| `mcagent.contextCacheSize` | `256` | server vantage: chat context bundles kept in memory |
+| `mcagent.contextCacheTtlSeconds` | `300` | server vantage: how long a bundle stays fetchable after capture |
 
 ## In-game commands
 

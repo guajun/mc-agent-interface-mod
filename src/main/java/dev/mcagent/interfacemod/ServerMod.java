@@ -3,6 +3,7 @@ package dev.mcagent.interfacemod;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.message.v1.ServerMessageEvents;
 
 import java.nio.file.Path;
 
@@ -34,6 +35,14 @@ public final class ServerMod implements ModInitializer {
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (core != null) {
                 core.onTick();
+            }
+        });
+        // Capture the sender's context the moment the server receives a chat
+        // message - not when a socket client or agent eventually reads the event.
+        ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) -> {
+            ServerCore current = core;
+            if (current != null) {
+                current.onChatMessage(sender, message.signedContent());
             }
         });
         System.out.println("[mc-agent-interface] server vantage armed, dir=" + dir + " basePort=" + port);
