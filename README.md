@@ -69,18 +69,20 @@ bare player name.
 ### Chat context bundles (server vantage)
 
 The server vantage does not just broadcast chat text. A mixin captures the
-sender's context at the head of chat packet handling - before the asynchronous
-chat filter and before any socket client or agent can delay handling - and
-parks it under the packet's identity. When the broadcast event arrives (even
-seconds later, after filtering) it consumes that receipt, so the bundle always
-describes the sender at packet receipt. The event carries an opaque id plus a
-compact summary:
+sender's context where the server thread decodes the chat message, before the
+asynchronous chat filter and before any socket client or agent can delay
+handling, and parks it under the message identity. When the broadcast event
+arrives (even seconds later, after filtering) it consumes that receipt, so the
+bundle always describes the sender at packet receipt. The event carries an
+opaque id plus a compact summary, and every bundle says whether it was frozen
+at `"timing":"receipt"` or, for a broadcast that had no packet receipt, a
+labelled `"timing":"broadcast"` fallback:
 
 ```json
 {"type":"chat","millis":...,"event":true,"seq":12,"tick":8451,
  "text":"hello","sender":"Notch","context_id":"ctx-2b1d...",
  "context":{"schema":"player-context/1","uuid":"069a79f4-...","name":"Notch",
-            "tick":8451,"dimension":"minecraft:overworld",
+            "tick":8451,"timing":"receipt","dimension":"minecraft:overworld",
             "x":10.5,"y":64.0,"z":-3.25,"yaw":180.0,"pitch":12.5,
             "view":{"type":"block"}}}
 ```
@@ -105,7 +107,7 @@ The server vantage answers `CONTEXT` requests for it:
 {"type":"context","millis":...,"status":"ok","context_id":"ctx-2b1d...",
  "ageMillis":842,"cache":{"capacity":256,"ttlMillis":300000,"size":3},
  "context":{"schema":"player-context/1","context_id":"ctx-2b1d...","seq":12,
-            "capturedAt":1790343000000,"tick":8451,"uuid":"069a79f4-...",
+            "capturedAt":1790343000000,"tick":8451,"timing":"receipt","uuid":"069a79f4-...",
             "name":"Notch","dimension":"minecraft:overworld","x":10.5,"y":64.0,
             "z":-3.25,"yaw":180.0,"pitch":12.5,
             "view":{"type":"block","distance":3.1,"block":"minecraft:stone",
@@ -127,7 +129,10 @@ the oldest bundle is evicted first; a lookup older than the TTL answers
 rather than served. Both limits are system properties (see Configuration).
 Receipt captures that never reach a broadcast are held for at most 60 seconds
 and use the same bound; only a bundle that was actually broadcast enters the
-cache, so junk packets cannot evict live context. Bundles contain server-known
+cache, so junk packets cannot evict live context. If filtering outlives the
+receipt TTL, the event reports a structured unavailable context
+(`"reason":"receipt_expired"`) instead of silently substituting the later
+transform. Bundles contain server-known
 values only - identity, transform, one view ray, schema string - never an
 entity snapshot or a world save, so the chat event stays small. The server
 `CAPS` advertises `"context"` and `"events:chat"` for this.

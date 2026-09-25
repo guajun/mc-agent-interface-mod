@@ -12,6 +12,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtUtils;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.PlayerChatMessage;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -244,41 +245,63 @@ public final class ServerCore implements LineHandler {
      * delay it. The bundle is frozen here and parked under the packet identity
      * until the matching broadcast consumes it.
      */
-    public void onChatReceipt(ServerPlayer sender, long salt) {
-        if (sender == null) {
+    public void onChatReceipt(ServerPlayer sender, PlayerChatMessage message) {
+        if (sender == null || message == null) {
             return;
         }
-        PlayerContext context = capture(chatSequence.incrementAndGet(), sender);
+        PlayerContext context = capture(chatSequence.incrementAndGet(), sender, PlayerContext.RECEIPT);
         if (context != null) {
-            receipts.put(ChatReceipts.key(sender.getStringUUID(), salt), context,
-                    System.currentTimeMillis());
+            receipts.put(receiptKey(message), context, System.currentTimeMillis());
         }
     }
 
     /**
      * Called from the server chat event when the message is broadcast - after
-     * the asynchronous filter. It consumes the receipt captured when the packet
-     * arrived and publishes it, so the event and the fetchable bundle describe
-     * the sender at receipt time even when filtering delayed the broadcast. A
-     * chat broadcast that did not come through {@code handleChat} falls back to
-     * a broadcast-time capture rather than losing its context.
+     * the asynchronous filter. It consumes the receipt frozen on the server
+     * thread before filtering and publishes it, so the event and the fetchable
+     * bundle describe the sender at receipt time. An expired receipt is reported
+     * as such instead of substituting live state; when there was no receipt at
+     * all (a broadcast that did not come through {@code handleChat}, or one
+     * evicted under capacity pressure) the capture is labelled
+     * {@link PlayerContext#BROADCAST} so callers can tell it apart.
      */
-    public void onChatMessage(ServerPlayer sender, String text, long salt) {
+    public void onChatMessage(ServerPlayer sender, PlayerChatMessage message) {
         long now = System.currentTimeMillis();
-        PlayerContext context = sender == null
-                ? null
-                : receipts.take(ChatReceipts.key(sender.getStringUUID(), salt), now);
-        if (context == null && sender != null) {
-            context = capture(chatSequence.incrementAndGet(), sender);
+        String text = message == null ? "" : message.signedContent();
+        String senderName = sender == null ? null : sender.getName().getString();
+        if (sender == null || message == null) {
+            sink.emit(ContextProtocol.chatEvent(chatSequence.incrementAndGet(), text, senderName, null));
+            return;
         }
-        if (context != null) {
-            contexts.put(context, now);
+
+        ChatReceipts.Lookup lookup = receipts.take(receiptKey(message), now);
+        PlayerContext fallback = null;
+        long seq;
+        if (lookup.status == ChatReceipts.Status.OK) {
+            seq = lookup.context.seq == null ? chatSequence.incrementAndGet() : lookup.context.seq;
+            contexts.put(lookup.context, now);
+        } else if (lookup.status == ChatReceipts.Status.EXPIRED) {
+            seq = chatSequence.incrementAndGet();
+        } else {
+            long fallbackSeq = chatSequence.incrementAndGet();
+            fallback = capture(fallbackSeq, sender, PlayerContext.BROADCAST);
+            if (fallback != null) {
+                contexts.put(fallback, now);
+            }
+            seq = fallbackSeq;
         }
-        long seq = context == null || context.seq == null
-                ? chatSequence.incrementAndGet()
-                : context.seq;
-        sink.emit(ContextProtocol.chatEvent(seq, text,
-                sender == null ? null : sender.getName().getString(), context));
+        sink.emit(ContextProtocol.chatEvent(seq, text, senderName, lookup, fallback));
+    }
+
+    /**
+     * Identity that survives chat decoding and filtering: the link, signature
+     * and signed body are the same on the message built by getSignedMessage and
+     * on the filtered message that reaches the broadcast event. In particular
+     * it does not depend on the packet salt, which an unsigned decode replaces
+     * with 0.
+     */
+    static String receiptKey(PlayerChatMessage message) {
+        return message.link() + "|" + message.signature() + "|" + message.signedBody();
     }
 
     private JsonObject contextJson(String contextId) {
@@ -286,11 +309,11 @@ public final class ServerCore implements LineHandler {
         return ContextProtocol.contextReply(contextId, lookup, contexts);
     }
 
-    private PlayerContext capture(Long seq, ServerPlayer player) {
+    private PlayerContext capture(Long seq, ServerPlayer player, String timing) {
         try {
             ServerLevel level = player.level();
             return new PlayerContext(seq, "ctx-" + UUID.randomUUID(), System.currentTimeMillis(),
-                    server.getTickCount(), InterfaceConstants.CONTEXT_SCHEMA,
+                    server.getTickCount(), InterfaceConstants.CONTEXT_SCHEMA, timing,
                     player.getStringUUID(), player.getName().getString(),
                     level.dimension().identifier().toString(),
                     player.getX(), player.getY(), player.getZ(), player.getYRot(), player.getXRot(),

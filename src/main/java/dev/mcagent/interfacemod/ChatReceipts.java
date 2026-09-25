@@ -7,21 +7,53 @@ import java.util.Map;
 /**
  * Receipt-time captures waiting for their broadcast.
  *
- * A chat packet is captured when the network handler first sees it, but the
- * matching broadcast event fires only after the asynchronous chat filter has
+ * A chat message is captured on the server thread before the asynchronous
+ * filter, but the matching broadcast event fires only after filtering has
  * finished. Between those two points the sender may move or turn, so the
- * frozen bundle is parked here under the packet's identity and consumed by the
+ * frozen bundle is parked here under the message identity and consumed by the
  * broadcast listener - the published bundle describes receipt time, never
  * broadcast time.
  *
  * Like the context cache, this store is bounded and expiring: a receipt whose
- * broadcast never arrives (invalid packet, cancelled message, mod broadcast)
- * is dropped after {@code ttlMillis} and the oldest entries are evicted first.
- * Only consumed receipts are published to the context cache, so junk packets
- * cannot evict live bundles. Lookups are by exact key, so a mismatched message
- * can never consume another player's receipt.
+ * broadcast never arrives (cancelled message, mod broadcast) is dropped after
+ * {@code ttlMillis} and the oldest entries are evicted first. A {@link #take}
+ * distinguishes a usable receipt from one that expired, so callers can report
+ * the loss instead of substituting later live state. Only consumed receipts
+ * are published to the context cache, so junk packets cannot evict live
+ * bundles. Lookups are by exact key, so a mismatched message can never consume
+ * another player's receipt.
  */
 public final class ChatReceipts {
+    public enum Status {
+        /** A fresh, frozen bundle for the message. */
+        OK,
+        /** The receipt existed but was older than the ttl. */
+        EXPIRED,
+        /** No receipt was parked for this message. */
+        NOT_FOUND
+    }
+
+    /** What one consumption found. Only {@link Status#OK} carries a bundle. */
+    public static final class Lookup {
+        public final Status status;
+        public final PlayerContext context;
+        /** When the receipt arrived; -1 when there was none. */
+        public final long receivedAtMillis;
+        /** Age at consumption; -1 when there was none. */
+        public final long ageMillis;
+
+        private Lookup(Status status, PlayerContext context, long receivedAtMillis, long ageMillis) {
+            this.status = status;
+            this.context = context;
+            this.receivedAtMillis = receivedAtMillis;
+            this.ageMillis = ageMillis;
+        }
+
+        public boolean ok() {
+            return status == Status.OK;
+        }
+    }
+
     private final int capacity;
     private final long ttlMillis;
     private final LinkedHashMap<String, Entry> entries = new LinkedHashMap<>();
@@ -32,11 +64,6 @@ public final class ChatReceipts {
     public ChatReceipts(int capacity, long ttlMillis) {
         this.capacity = Math.max(1, capacity);
         this.ttlMillis = Math.max(1L, ttlMillis);
-    }
-
-    /** Identity of one chat packet: sender UUID plus the packet's random salt. */
-    public static String key(String senderUuid, long salt) {
-        return senderUuid + ":" + salt;
     }
 
     public synchronized void put(String key, PlayerContext context, long nowMillis) {
@@ -54,21 +81,22 @@ public final class ChatReceipts {
     }
 
     /**
-     * Consume the frozen capture for one message, or null when there is none
-     * (a broadcast that never passed through the network handler) or when it
-     * has expired. One receipt is used at most once.
+     * Consume the frozen capture for one message. Missing and expired receipts
+     * are distinct so the caller can label or refuse a broadcast-time fallback
+     * rather than present it as receipt-time state.
      */
-    public synchronized PlayerContext take(String key, long nowMillis) {
+    public synchronized Lookup take(String key, long nowMillis) {
         Entry entry = entries.remove(key);
         if (entry == null) {
-            return null;
+            return new Lookup(Status.NOT_FOUND, null, -1L, -1L);
         }
-        if (nowMillis - entry.receivedAtMillis > ttlMillis) {
+        long age = nowMillis - entry.receivedAtMillis;
+        if (age > ttlMillis) {
             expired++;
-            return null;
+            return new Lookup(Status.EXPIRED, null, entry.receivedAtMillis, age);
         }
         matched++;
-        return entry.context;
+        return new Lookup(Status.OK, entry.context, entry.receivedAtMillis, age);
     }
 
     private void purgeExpired(long nowMillis) {

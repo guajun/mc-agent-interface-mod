@@ -15,6 +15,11 @@ import com.google.gson.JsonObject;
  * regular server-vantage requests.
  */
 public final class PlayerContext {
+    /** Timing label for a bundle frozen when the chat packet arrived. */
+    public static final String RECEIPT = "receipt";
+    /** Timing label for a capture made at broadcast time, not packet receipt. */
+    public static final String BROADCAST = "broadcast";
+
     /** Monotonic chat event sequence, null for an ad-hoc capture. */
     public final Long seq;
     /** Opaque correlation id; never derived from a player name. */
@@ -22,6 +27,8 @@ public final class PlayerContext {
     public final long capturedAtMillis;
     public final int tick;
     public final String schema;
+    /** {@link #RECEIPT} for a packet-time freeze, {@link #BROADCAST} for a fallback. */
+    public final String timing;
     public final String uuid;
     public final String name;
     public final String dimension;
@@ -33,13 +40,14 @@ public final class PlayerContext {
     public final ViewTarget view;
 
     public PlayerContext(Long seq, String contextId, long capturedAtMillis, int tick, String schema,
-                         String uuid, String name, String dimension, double x, double y, double z,
-                         float yaw, float pitch, ViewTarget view) {
+                         String timing, String uuid, String name, String dimension, double x, double y,
+                         double z, float yaw, float pitch, ViewTarget view) {
         this.seq = seq;
         this.contextId = contextId;
         this.capturedAtMillis = capturedAtMillis;
         this.tick = tick;
         this.schema = schema;
+        this.timing = timing;
         this.uuid = uuid;
         this.name = name;
         this.dimension = dimension;
@@ -61,6 +69,7 @@ public final class PlayerContext {
         }
         object.addProperty("capturedAt", capturedAtMillis);
         object.addProperty("tick", tick);
+        object.addProperty("timing", timing);
         object.addProperty("uuid", uuid);
         object.addProperty("name", name);
         object.addProperty("dimension", dimension);
@@ -84,6 +93,7 @@ public final class PlayerContext {
         object.addProperty("uuid", uuid);
         object.addProperty("name", name);
         object.addProperty("tick", tick);
+        object.addProperty("timing", timing);
         object.addProperty("dimension", dimension);
         object.addProperty("x", x);
         object.addProperty("y", y);

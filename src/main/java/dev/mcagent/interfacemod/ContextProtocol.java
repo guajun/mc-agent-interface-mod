@@ -41,6 +41,42 @@ public final class ContextProtocol {
         return object;
     }
 
+    /**
+     * The publication decision for a broadcast message: a fresh receipt is
+     * published as receipt-time, an expired one becomes a structured expiry,
+     * and a missing one may only carry an explicitly broadcast-time fallback.
+     */
+    public static JsonObject chatEvent(long seq, String text, String senderName, ChatReceipts.Lookup lookup,
+                                       PlayerContext fallback) {
+        if (lookup.status == ChatReceipts.Status.EXPIRED) {
+            return chatEventExpired(seq, text, senderName, lookup.receivedAtMillis, lookup.ageMillis);
+        }
+        PlayerContext context = lookup.status == ChatReceipts.Status.OK ? lookup.context : fallback;
+        return chatEvent(seq, text, senderName, context);
+    }
+
+    /**
+     * A chat event whose receipt-time bundle is gone. It carries no context id
+     * and no live substitute: the caller can see that the frozen context was
+     * lost and when the packet arrived.
+     */
+    public static JsonObject chatEventExpired(long seq, String text, String senderName, long receivedAtMillis,
+                                              long ageMillis) {
+        JsonObject object = base("chat");
+        object.addProperty("seq", seq);
+        object.addProperty("text", text == null ? "" : text);
+        if (senderName != null && !senderName.isEmpty()) {
+            object.addProperty("sender", senderName);
+        }
+        JsonObject unavailable = new JsonObject();
+        unavailable.addProperty("available", false);
+        unavailable.addProperty("reason", "receipt_expired");
+        unavailable.addProperty("receivedAt", receivedAtMillis);
+        unavailable.addProperty("ageMillis", ageMillis);
+        object.add("context", unavailable);
+        return object;
+    }
+
     public static JsonObject contextReply(String contextId, PlayerContextCache.Lookup lookup,
                                           PlayerContextCache cache) {
         JsonObject object = base("context");
