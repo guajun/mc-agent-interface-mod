@@ -9,6 +9,7 @@ import net.minecraft.commands.CommandSource;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtUtils;
@@ -23,6 +24,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntitySelector;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.projectile.ProjectileUtil;
+import net.minecraft.world.item.component.AttackRange;
 import net.minecraft.world.level.entity.EntityTickList;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.storage.LevelResource;
@@ -291,13 +293,40 @@ public final class ServerCore implements LineHandler {
     }
 
     /**
-     * The server-side equivalent of the crosshair pick: blocks along the look
-     * vector up to the block interaction range, entities up to the entity
-     * interaction range, whichever is closer. This mirrors the vanilla client's
-     * pick, so the answer is what the player would see - except it is computed
-     * from the authoritative server state, not from client UI.
+     * The server-side equivalent of the crosshair pick. It has the same two
+     * stages as the vanilla 26.2 client: first the active item's attack range
+     * (a spear reaches past the ordinary entity interaction range), then, when
+     * that stage is absent or misses, the ordinary pick with the player's block
+     * and entity interaction ranges. Everything is computed from server-known
+     * state; no client crosshair, camera or screen is read.
      */
     private JsonObject viewTargetJson(ServerPlayer player, ServerLevel level, Vec3 eye, Vec3 look) {
+        HitResult hit = itemTarget(player, eye);
+        if (hit == null || hit.getType() == HitResult.Type.MISS) {
+            hit = pickTarget(player, eye, look);
+        }
+        return targetJson(hit, level, eye);
+    }
+
+    /**
+     * The active item's attack-range stage. Items carrying ATTACK_RANGE (the
+     * spears) select their hit first, and a block hit is still filtered to the
+     * block interaction range, exactly like the client.
+     */
+    private static HitResult itemTarget(ServerPlayer player, Vec3 eye) {
+        AttackRange attackRange = player.getActiveItem().get(DataComponents.ATTACK_RANGE);
+        if (attackRange == null) {
+            return null;
+        }
+        HitResult hit = attackRange.getClosesetHit(player, 1.0F, EntitySelector.CAN_BE_PICKED);
+        if (hit instanceof BlockHitResult) {
+            hit = clampToRange(hit, eye, player.blockInteractionRange());
+        }
+        return hit;
+    }
+
+    /** The ordinary pick used when the item stage is absent or misses. */
+    private static HitResult pickTarget(ServerPlayer player, Vec3 eye, Vec3 look) {
         double blockRange = player.blockInteractionRange();
         double entityRange = player.entityInteractionRange();
         double maxRange = Math.max(blockRange, entityRange);
@@ -317,13 +346,14 @@ public final class ServerCore implements LineHandler {
         EntityHitResult entityHit = ProjectileUtil.getEntityHitResult(
                 player, eye, end, search, EntitySelector.CAN_BE_PICKED, entityLimitSq);
 
-        HitResult hit;
         if (entityHit != null && entityHit.getLocation().distanceToSqr(eye) < blockDistanceSq) {
-            hit = clampToRange(entityHit, eye, entityRange);
-        } else {
-            hit = clampToRange(blockHit, eye, blockRange);
+            return clampToRange(entityHit, eye, entityRange);
         }
+        return clampToRange(blockHit, eye, blockRange);
+    }
 
+    /** One hit as JSON: block details, the full entity record, or a miss. */
+    private static JsonObject targetJson(HitResult hit, ServerLevel level, Vec3 eye) {
         JsonObject target = new JsonObject();
         target.add("hit", vector(hit.getLocation()));
         target.addProperty("distance", Math.sqrt(hit.getLocation().distanceToSqr(eye)));

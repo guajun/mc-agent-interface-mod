@@ -3,26 +3,27 @@
 
 Connects to a running mc-agent-interface server-vantage socket - the port in
 ``<serverDir>/port.txt``, 25581 by default - and checks the per-player context
-reply and the server-side view-target raycast:
+reply and the server-side view-target raycast.
 
-* CAPS advertises the new capability;
+The default run never edits terrain and never deletes anything it did not
+create:
+
+* hello and CAPS advertise the new capability;
 * a valid player resolves by UUID and by name, with a stable UUID, dimension,
-  position, rotation and a view target;
+  position, rotation and a view target. The subject is an existing online
+  player when ``--player`` is given, otherwise a uniquely named Carpet fake
+  probe that is removed again;
 * an unknown player is a structured ``found:false`` answer and does not drop
-  the connection;
-* the raycast returns block, entity and miss targets, all computed on the
-  server from the player's eye position and look vector.
+  the connection.
 
-The instance under test needs the mod plus Fabric API and Carpet, because the
-test spawns a fake probe player when none is given. It works the same against a
-dedicated server and the integrated server of a single-player world:
+``--allow-world-edits`` adds the raycast scenarios (block, entity, miss and a
+spear's attack range). That mode clears and places blocks only inside one small
+documented box and summons one tagged pig, so it needs a disposable or isolated
+world. It never touches unowned content: the probe carries a per-run name and
+the summoned fixture a per-run tag, and cleanup removes exactly those.
 
-    python tests/player_context_test.py --port 25581
     python tests/player_context_test.py --port 25581 --player gua_jun
-
-The raycast scenarios use a controlled part of the world at y=200: the probe is
-teleported there, the ray path is filled with air, and blocks/entities are
-placed only for the block and entity cases. Nothing outside that box changes.
+    python tests/player_context_test.py --port 25581 --allow-world-edits
 """
 
 from __future__ import annotations
@@ -34,7 +35,12 @@ import sys
 import time
 import uuid
 
-PROBE = "AgentProbe"
+#: Unique per run, so the fixture can never collide with a real player and the
+#: cleanup can never delete somebody else's entity.
+RUN_ID = uuid.uuid4().hex[:8]
+PROBE = "Probe" + RUN_ID
+FIXTURE_TAG = "mcagent-probe-" + RUN_ID
+
 PROBE_X = 0.5
 PROBE_Y = 200.0
 PROBE_Z = 0.5
@@ -44,6 +50,7 @@ BLOCK_Z = 3
 PIG_X = 0.5
 PIG_Y = 201.0
 PIG_Z = 2.5
+SPEAR = "minecraft:iron_spear"
 
 
 class CheckError(AssertionError):
@@ -133,11 +140,8 @@ def wait_for_player(mod: ModConnection, name: str, timeout: float = 20.0) -> dic
 
 
 def spawn_probe(mod: ModConnection) -> dict:
-    """Spawn the fake player if needed and park it at the test spot."""
+    """Spawn the uniquely named fake player at the test spot and park it."""
     mod.command(f"player {PROBE} kill")
-    # Spawn directly at the test spot: that also loads the chunk before any
-    # fill/setblock runs, so the probe does not fall through an unloaded world
-    # while it waits for the Carpet profile check.
     mod.command(f"player {PROBE} spawn at {PROBE_X} {PROBE_Y} {PROBE_Z}")
     player = wait_for_player(mod, PROBE)
     park_probe(mod)
@@ -145,14 +149,44 @@ def spawn_probe(mod: ModConnection) -> dict:
 
 
 def park_probe(mod: ModConnection) -> None:
-    """Teleport the probe, give it a floor, and clear the ray path at y=200."""
-    time.sleep(0.5)
-    mod.command(f"fill -2 198 -2 2 204 6 minecraft:air")
-    mod.command(f"setblock 0 199 0 minecraft:stone")
-    mod.command(
-        f"kill @e[x={PROBE_X},y={PROBE_Y},z={PROBE_Z},distance=..8,type=!minecraft:player]"
-    )
+    """Point the probe at the cleared box; this does not edit terrain."""
     mod.command(f"tp {PROBE} {PROBE_X} {PROBE_Y} {PROBE_Z} 0 0")
+
+
+def prepare_ray_box(mod: ModConnection) -> None:
+    """Destructive: clear the documented ray box and add a floor under the probe.
+
+    Only called in --allow-world-edits mode. The box is x=-2..2, y=198..204,
+    z=-2..6 around the probe; nothing outside it is touched, and no entity is
+    removed here.
+    """
+    time.sleep(0.3)
+    mod.command("fill -2 198 -2 2 204 6 minecraft:air")
+    mod.command("setblock 0 199 0 minecraft:stone")
+    park_probe(mod)
+
+
+def wait_tick(mod: ModConnection) -> None:
+    """Let one server tick pass so summons/removals are visible to the raycast."""
+    mod.request("WAIT 1")
+
+
+def summon_fixture(mod: ModConnection, x: float, y: float, z: float) -> None:
+    mod.command(
+        f"summon minecraft:pig {x} {y} {z} "
+        f'{{NoGravity:1b,Silent:1b,DeathLootTable:"minecraft:empty",Tags:["{FIXTURE_TAG}"]}}'
+    )
+    wait_tick(mod)
+
+
+def kill_fixture(mod: ModConnection) -> None:
+    """Remove only the entities summoned by this run, then let the tick land."""
+    mod.command(f"kill @e[tag={FIXTURE_TAG}]")
+    wait_tick(mod)
+
+
+def equip(mod: ModConnection, item: str) -> None:
+    mod.command(f"item replace entity {PROBE} weapon.mainhand with {item}")
 
 
 def view_target(mod: ModConnection, query: str) -> dict:
@@ -162,10 +196,102 @@ def view_target(mod: ModConnection, query: str) -> dict:
     return reply.get("view", {}).get("target", {})
 
 
+def check_identity(checks: Checks, mod: ModConnection, subject: dict) -> None:
+    """The valid-player checks, by UUID, by name and by a plain UUID."""
+    by_uuid = mod.request(f"PLAYER {subject['uuid']}")
+    checks.equal("valid player found by uuid", by_uuid.get("found"), True)
+    checks.equal("uuid query matched by uuid", by_uuid.get("matchedBy"), "uuid")
+    described = by_uuid.get("player", {})
+    checks.equal("reply carries the stable uuid", described.get("uuid"), subject["uuid"])
+    checks.equal("reply carries the player name", described.get("name"), subject["name"])
+    checks.ok("reply carries a dimension", bool(described.get("dimension")), str(described))
+    checks.ok("reply carries rotation", "yaw" in described and "pitch" in described, str(described))
+    view = by_uuid.get("view", {})
+    checks.ok("reply carries the view ray", bool(view.get("direction")), str(view))
+    checks.ok("reply carries the eye position", bool(view.get("eye")), str(view))
+
+    by_name = mod.request(f"PLAYER {subject['name']}")
+    checks.equal("valid player found by name", by_name.get("found"), True)
+    checks.equal("name query matched by name", by_name.get("matchedBy"), "name")
+    checks.equal(
+        "name and uuid resolve to the same player",
+        by_name.get("player", {}).get("uuid"),
+        subject["uuid"],
+    )
+
+    plain = uuid.UUID(subject["uuid"]).hex
+    by_plain = mod.request(f"PLAYER {plain}")
+    checks.equal("plain uuid also resolves", by_plain.get("player", {}).get("uuid"), subject["uuid"])
+
+
+def check_unknown(checks: Checks, mod: ModConnection) -> None:
+    """Unknown players are structured answers, and the connection survives."""
+    unknown_uuid = mod.request(f"PLAYER {uuid.uuid4()}")
+    checks.equal("unknown uuid is not found", unknown_uuid.get("found"), False)
+    checks.ok("unknown uuid carries an error", bool(unknown_uuid.get("error")), str(unknown_uuid))
+    unknown_name = mod.request(f"PLAYER no_such_player_{uuid.uuid4().hex[:8]}")
+    checks.equal("unknown name is not found", unknown_name.get("found"), False)
+    checks.equal("connection survives unknown players", mod.request("PING").get("type"), "pong")
+
+
+def check_raycast(checks: Checks, mod: ModConnection) -> None:
+    """The destructive scenarios; only run with --allow-world-edits."""
+    probe = wait_for_player(mod, PROBE)
+    probe_uuid = probe["uuid"]
+    prepare_ray_box(mod)
+
+    # The probe is parked in a cleared box, looking along +Z.
+    miss = view_target(mod, probe_uuid)
+    checks.equal("raycast miss type", miss.get("type"), "miss")
+    checks.ok("miss carries a hit position", bool(miss.get("hit")), str(miss))
+
+    # A block on the look axis is the target.
+    mod.command(f"setblock {BLOCK_X} {BLOCK_Y} {BLOCK_Z} minecraft:stone")
+    block = view_target(mod, probe_uuid)
+    checks.equal("raycast block type", block.get("type"), "block")
+    block_info = block.get("block", {})
+    checks.equal("block position x", block_info.get("x"), BLOCK_X)
+    checks.equal("block position y", block_info.get("y"), BLOCK_Y)
+    checks.equal("block position z", block_info.get("z"), BLOCK_Z)
+    checks.equal("block id", block_info.get("id"), "minecraft:stone")
+    checks.ok("block carries a face", bool(block_info.get("face")), str(block_info))
+
+    # An entity closer than any block is the target (ordinary interaction range).
+    mod.command(f"setblock {BLOCK_X} {BLOCK_Y} {BLOCK_Z} minecraft:air")
+    summon_fixture(mod, PIG_X, PIG_Y, PIG_Z)
+    entity = view_target(mod, probe_uuid)
+    checks.equal("raycast entity type", entity.get("type"), "entity")
+    entity_info = entity.get("entity", {})
+    checks.equal("entity target type", entity_info.get("type"), "minecraft:pig")
+    checks.ok("entity target carries a uuid", bool(entity_info.get("uuid")), str(entity_info))
+
+    # The active item's attack range: move the same fixture out past the
+    # ordinary entity range, equip the spear, and check the same entity comes
+    # back within reach. Moving beats killing here, because a dying entity keeps
+    # its hitbox for the death animation and would shadow the real target.
+    equip(mod, "minecraft:air")
+    ordinary = mod.request(f"PLAYER {probe_uuid}")
+    entity_range = float(ordinary["view"]["entityRange"])
+    far_z = PROBE_Z + entity_range + 0.8
+    mod.command(f"tp @e[tag={FIXTURE_TAG}] {PIG_X} {PIG_Y} {far_z}")
+    wait_tick(mod)
+    equip(mod, SPEAR)
+    spear = view_target(mod, probe_uuid)
+    checks.equal("spear attack range selects the far entity", spear.get("type"), "entity")
+    checks.ok(
+        "spear hit is beyond the ordinary entity range",
+        float(spear.get("distance", 0.0)) > entity_range,
+        f"distance={spear.get('distance')!r} entityRange={entity_range!r}",
+    )
+    equip(mod, "minecraft:air")
+    fallback = view_target(mod, probe_uuid)
+    checks.equal("without the spear the far entity is out of reach", fallback.get("type"), "miss")
+
+
 def run(args: argparse.Namespace) -> int:
     checks = Checks()
     mod = ModConnection(args.host, args.port, args.timeout)
-    online = wait_for_player(mod, args.player) if args.player else None
+    created_probe = False
     try:
         hello = mod.hello
         checks.equal("hello identifies the server vantage", hello.get("instance"), "server")
@@ -184,86 +310,30 @@ def run(args: argparse.Namespace) -> int:
             f"capabilities={caps.get('capabilities')}",
         )
 
-        probe = spawn_probe(mod)
-        probe_uuid = probe["uuid"]
+        # A real online player when one was named, otherwise an owned probe.
+        if args.player:
+            subject = wait_for_player(mod, args.player)
+        else:
+            subject = spawn_probe(mod)
+            created_probe = True
+        check_identity(checks, mod, subject)
+        check_unknown(checks, mod)
 
-        # Valid player, by stable UUID.
-        by_uuid = mod.request(f"PLAYER {probe_uuid}")
-        checks.equal("valid player found by uuid", by_uuid.get("found"), True)
-        checks.equal("uuid query matched by uuid", by_uuid.get("matchedBy"), "uuid")
-        described = by_uuid.get("player", {})
-        checks.equal("reply carries the stable uuid", described.get("uuid"), probe_uuid)
-        checks.equal("reply carries the player name", described.get("name"), PROBE)
-        checks.ok("reply carries a dimension", bool(described.get("dimension")), str(described))
-        checks.ok("reply carries rotation", "yaw" in described and "pitch" in described, str(described))
-        view = by_uuid.get("view", {})
-        checks.ok("reply carries the view ray", bool(view.get("direction")), str(view))
-        checks.ok("reply carries the eye position", bool(view.get("eye")), str(view))
-
-        # Valid player, by name - convenience only.
-        by_name = mod.request(f"PLAYER {PROBE}")
-        checks.equal("valid player found by name", by_name.get("found"), True)
-        checks.equal("name query matched by name", by_name.get("matchedBy"), "name")
-        checks.equal(
-            "name and uuid resolve to the same player",
-            by_name.get("player", {}).get("uuid"),
-            probe_uuid,
-        )
-
-        # A dashed and a plain UUID both work.
-        plain = uuid.UUID(probe_uuid).hex
-        by_plain = mod.request(f"PLAYER {plain}")
-        checks.equal("plain uuid also resolves", by_plain.get("player", {}).get("uuid"), probe_uuid)
-
-        # Unknown players are structured answers, and the connection survives.
-        unknown_uuid = mod.request(f"PLAYER {uuid.uuid4()}")
-        checks.equal("unknown uuid is not found", unknown_uuid.get("found"), False)
-        checks.ok("unknown uuid carries an error", bool(unknown_uuid.get("error")), str(unknown_uuid))
-        unknown_name = mod.request(f"PLAYER no_such_player_{uuid.uuid4().hex[:8]}")
-        checks.equal("unknown name is not found", unknown_name.get("found"), False)
-        checks.equal("connection survives unknown players", mod.request("PING").get("type"), "pong")
-
-        # The probe is parked in a cleared box, looking along +Z.
-        park_probe(mod)
-        miss = view_target(mod, probe_uuid)
-        checks.equal("raycast miss type", miss.get("type"), "miss")
-        checks.ok("miss carries a hit position", bool(miss.get("hit")), str(miss))
-
-        # A block on the look axis is the target.
-        mod.command(f"setblock {BLOCK_X} {BLOCK_Y} {BLOCK_Z} minecraft:stone")
-        block = view_target(mod, probe_uuid)
-        checks.equal("raycast block type", block.get("type"), "block")
-        block_info = block.get("block", {})
-        checks.equal("block position x", block_info.get("x"), BLOCK_X)
-        checks.equal("block position y", block_info.get("y"), BLOCK_Y)
-        checks.equal("block position z", block_info.get("z"), BLOCK_Z)
-        checks.equal("block id", block_info.get("id"), "minecraft:stone")
-        checks.ok("block carries a face", bool(block_info.get("face")), str(block_info))
-
-        # An entity closer than any block is the target.
-        mod.command(f"setblock {BLOCK_X} {BLOCK_Y} {BLOCK_Z} minecraft:air")
-        mod.command(
-            f"summon minecraft:pig {PIG_X} {PIG_Y} {PIG_Z} {{NoGravity:1b,Silent:1b}}"
-        )
-        entity = view_target(mod, probe_uuid)
-        checks.equal("raycast entity type", entity.get("type"), "entity")
-        entity_info = entity.get("entity", {})
-        checks.equal("entity target type", entity_info.get("type"), "minecraft:pig")
-        checks.ok("entity target carries a uuid", bool(entity_info.get("uuid")), str(entity_info))
-
-        # The requested player is the one described, with a live view.
-        described_again = mod.request(f"PLAYER {probe_uuid}").get("player", {})
-        checks.equal("resolved player stays stable", described_again.get("uuid"), probe_uuid)
-
-        if online is not None:
-            live = mod.request(f"PLAYER {online['uuid']}")
-            checks.equal("named online player resolves", live.get("player", {}).get("uuid"), online["uuid"])
+        if args.allow_world_edits:
+            if not created_probe:
+                spawn_probe(mod)
+                created_probe = True
+            check_raycast(checks, mod)
+        else:
+            print("SKIP  raycast scenarios: pass --allow-world-edits in a disposable world")
     finally:
-        try:
-            mod.command(f"kill @e[type=minecraft:pig,x={PROBE_X},y={PROBE_Y},z={PROBE_Z},distance=..16]")
-            mod.command(f"player {PROBE} kill")
-        except (OSError, CheckError):
-            pass
+        if created_probe:
+            try:
+                if args.allow_world_edits:
+                    kill_fixture(mod)
+                mod.command(f"player {PROBE} kill")
+            except (OSError, CheckError):
+                pass
         mod.close()
 
     print()
@@ -284,7 +354,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--player",
         default="",
-        help="optional real online player name to check in addition to the probe",
+        help="existing online player to check read-only; otherwise an owned probe is spawned",
+    )
+    parser.add_argument(
+        "--allow-world-edits",
+        action="store_true",
+        help="run the destructive raycast scenarios (disposable/isolated world only)",
     )
     return parser.parse_args()
 

@@ -122,12 +122,13 @@ one of:
 - `miss` - carries only `hit` and `distance`.
 
 The target is a server-side raycast from the player's eye position along the
-player's server-known look vector, using the player's interaction ranges, run on
-the server thread when the request is handled. It mirrors the vanilla pick (the
-nearer of the block and entity hit, and an out-of-reach hit becomes a miss) but
-reads no client state: no crosshair, camera, screen or GUI. The same request
-therefore works with a dedicated server and with the integrated server of a
-single-player world.
+player's server-known look vector, run on the server thread when the request is
+handled. It has the same two stages as the vanilla 26.2 pick: an item carrying
+an attack range (the spears) selects first, then the ordinary block/entity pick
+with the player's interaction ranges is the fallback, with an out-of-reach hit
+becoming a miss. No client state is read: no crosshair, camera, screen or GUI.
+The same request therefore works with a dedicated server and with the
+integrated server of a single-player world.
 
 An unknown player is a structured answer, not an error and not a dropped
 connection:
@@ -159,18 +160,24 @@ Output: `dist/mc-agent-interface-0.6.0.jar`. Put it together with
 
 ## Tests
 
-`tests/player_context_test.py` is the protocol test for the server vantage. It
-talks to a running instance with the mod and Fabric API plus Carpet: the test
-spawns a fake probe player to drive the raycast scenarios, and `--player NAME`
-additionally checks a real online player's identity:
+`tests/player_context_test.py` is the protocol test for the server vantage. The
+default run never edits terrain and never deletes anything it did not create:
+it checks `CAPS`, an unknown player, and a valid player - an existing one with
+`--player`, otherwise a uniquely named Carpet fake probe that is removed
+afterwards:
 
 ```bash
-python tests/player_context_test.py --port 25581
+python tests/player_context_test.py --port 25581 --player gua_jun
 ```
 
-It checks `CAPS`, resolves a valid player by UUID and by name, answers an
-unknown player without dropping the connection, and covers the server raycast
-for block, entity and miss.
+`--allow-world-edits` adds the server-raycast scenarios (block, entity, miss,
+and a spear's attack-range case). It clears and places blocks only inside a
+small documented box and tags its summoned fixture, but that box is still
+destructive: run this mode only against a disposable or isolated world.
+
+```bash
+python tests/player_context_test.py --port 25581 --allow-world-edits
+```
 
 ## Configuration
 
