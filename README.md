@@ -19,7 +19,7 @@ Messages are UTF-8 text, one JSON object per line.
 On connect the mod sends:
 
 ```json
-{"type":"hello","mod":"mc-agent-interface","version":"0.1.0","protocol":1,
+{"type":"hello","mod":"mc-agent-interface","version":"0.6.0","protocol":1,
  "minecraft":"26.2","port":25580,
  "capabilities":["state","entities","command","chat","record","wait","screen",
                   "mark","connect","events:chat","events:game"]}
@@ -72,6 +72,76 @@ just a player entity as far as the client is concerned.
 
 Per-tick samples are appended to `<gameDir>/mc-agent/samples.jsonl`.
 
+## Server vantage
+
+When it runs inside a server - a dedicated one or the integrated server of a
+single-player world - the mod also listens on `mcagent.serverPort` (`25581` by
+default, falling back to the next free port) and writes the actual port to
+`<mcagent.serverDir>/port.txt` (`mc-agent-server/` by default). Its `hello` says
+`"instance":"server"`, and its data is authoritative: requests are answered on
+the server thread.
+
+The server vantage speaks the same JSON-lines protocol as the client one, with
+the shared `STATE`, `ENTITIES`, `CMD`, `WAIT`, `MARK`, `CAPS` and `PING`
+requests plus:
+
+| Request | Meaning |
+| --- | --- |
+| `PLAYER <uuid\|name>` | one online player's server-known context and view target |
+| `SNAPSHOT [radius] [name]` / `SNAPSHOTS` | fork/list a live world (snapshot protocol) |
+
+### `PLAYER`
+
+`PLAYER` resolves one online player by stable UUID first (dashes optional) and
+by name as a convenience; `matchedBy` says which was used. The reply is the
+player's server-known state at request time:
+
+```json
+{"type":"player","instance":"server","protocol":1,"modVersion":"0.6.0",
+ "tick":104233,"query":"069a79f4-44e9-4726-a5be-fca90e38aaf5","found":true,
+ "matchedBy":"uuid",
+ "player":{"id":123,"uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5",
+   "type":"minecraft:player","name":"Notch","x":10.5,"y":64.0,"z":-3.25,
+   "vx":0.0,"vy":-0.0784,"vz":0.0,"yaw":180.0,"pitch":12.5,
+   "health":20.0,"maxHealth":20.0,"gameMode":"survival",
+   "dimension":"minecraft:overworld","eye":[10.5,65.62,-3.25],"onGround":true},
+ "view":{"eye":[10.5,65.62,-3.25],"direction":[0.0,0.216,0.976],
+   "blockRange":4.5,"entityRange":3.0,
+   "target":{"type":"block","hit":[10.5,65.5,-0.25],"distance":3.1,
+     "block":{"x":10,"y":65,"z":0,"id":"minecraft:stone","name":"Stone",
+       "face":"north","inside":false}}}}
+```
+
+The `player` object is the same record `ENTITIES` gives for a player (identity,
+position, velocity, rotation, health, game mode), with `dimension` and the eye
+position added. `view` adds the ray and its target, where `view.target.type` is
+one of:
+
+- `block` - carries `block.{x,y,z,id,name,face,inside}`;
+- `entity` - carries the same record `ENTITIES` gives, under `entity`;
+- `miss` - carries only `hit` and `distance`.
+
+The target is a server-side raycast from the player's eye position along the
+player's server-known look vector, using the player's interaction ranges, run on
+the server thread when the request is handled. It mirrors the vanilla pick (the
+nearer of the block and entity hit, and an out-of-reach hit becomes a miss) but
+reads no client state: no crosshair, camera, screen or GUI. The same request
+therefore works with a dedicated server and with the integrated server of a
+single-player world.
+
+An unknown player is a structured answer, not an error and not a dropped
+connection:
+
+```json
+{"type":"player","instance":"server","found":false,
+ "query":"ghost","error":"no online player matches ghost"}
+```
+
+Server `CAPS` advertises `"player"` (resolve one player and return their
+context) and `"player:view"` (the server-side view-target raycast). The socket
+still binds to loopback only, so a co-located Toolkit reaches it exactly like
+the client socket and nothing becomes public.
+
 ## Build
 
 Minecraft Java 26.2 ships unobfuscated class files, so the mod is compiled
@@ -84,8 +154,23 @@ python build.py \
   --jdk "C:/Program Files/Java/jdk-25"
 ```
 
-Output: `dist/mc-agent-interface-0.1.0.jar`. Put it together with
+Output: `dist/mc-agent-interface-0.6.0.jar`. Put it together with
 `fabric-api-*.jar` into the client's `mods/` directory.
+
+## Tests
+
+`tests/player_context_test.py` is the protocol test for the server vantage. It
+talks to a running instance with the mod and Fabric API plus Carpet: the test
+spawns a fake probe player to drive the raycast scenarios, and `--player NAME`
+additionally checks a real online player's identity:
+
+```bash
+python tests/player_context_test.py --port 25581
+```
+
+It checks `CAPS`, resolves a valid player by UUID and by name, answers an
+unknown player without dropping the connection, and covers the server raycast
+for block, entity and miss.
 
 ## Configuration
 

@@ -8,7 +8,7 @@ package dev.mcagent.interfacemod;
  */
 public final class InterfaceConstants {
     public static final String MOD_ID = "mc-agent-interface";
-    public static final String VERSION = "0.5.2";
+    public static final String VERSION = "0.6.0";
     public static final int PROTOCOL_VERSION = 1;
 
     public static final int DEFAULT_CLIENT_PORT = 25580;
@@ -19,7 +19,8 @@ public final class InterfaceConstants {
                     + "\"world\",\"lan\",\"events:chat\",\"events:game\"]";
 
     public static final String SERVER_CAPABILITIES =
-            "[\"state\",\"entities\",\"command\",\"wait\",\"mark\",\"snapshot\",\"events:game\"]";
+            "[\"state\",\"entities\",\"player\",\"player:view\",\"command\",\"wait\",\"mark\",\"snapshot\","
+                    + "\"events:game\"]";
 
     private InterfaceConstants() {
     }
