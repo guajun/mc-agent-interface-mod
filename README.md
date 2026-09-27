@@ -1,6 +1,6 @@
 # mc-agent-interface
 
-📖 Part of **mc-agent**; the guide lives at <https://guajun.github.io/mc-agent/>.
+馃摉 Part of **mc-agent**; the guide lives at <https://guajun.github.io/mc-agent/>.
 
 Generic Fabric mod that exposes a local, versioned interface for agent runtimes.
 One jar, two entrypoints: a **client vantage** and a **server vantage**.
@@ -19,7 +19,7 @@ Messages are UTF-8 text, one JSON object per line.
 On connect the mod sends:
 
 ```json
-{"type":"hello","mod":"mc-agent-interface","version":"0.1.0","protocol":1,
+{"type":"hello","mod":"mc-agent-interface","version":"0.6.0","protocol":1,
  "minecraft":"26.2","port":25580,
  "capabilities":["state","entities","command","chat","record","wait","screen",
                   "mark","connect","events:chat","events:game"]}
@@ -66,11 +66,156 @@ shift every later answer by one).
 component, so clients should extract the name defensively rather than assume a
 bare player name.
 
+### Chat context bundles (server vantage)
+
+The server vantage does not just broadcast chat text. A mixin captures the
+sender's context where the server thread decodes the chat message, before the
+asynchronous chat filter and before any socket client or agent can delay
+handling, and parks it under the message identity. When the broadcast event
+arrives (even seconds later, after filtering) it consumes that receipt, so the
+bundle always describes the sender at packet receipt. The event carries an
+opaque id plus a compact summary, and every bundle says whether it was frozen
+at `"timing":"receipt"` or, for a broadcast that had no packet receipt, a
+labelled `"timing":"broadcast"` fallback:
+
+```json
+{"type":"chat","millis":...,"event":true,"seq":12,"tick":8451,
+ "text":"hello","sender":"Notch","context_id":"ctx-2b1d...",
+ "context":{"schema":"player-context/1","uuid":"069a79f4-...","name":"Notch",
+            "tick":8451,"timing":"receipt","dimension":"minecraft:overworld",
+            "x":10.5,"y":64.0,"z":-3.25,"yaw":180.0,"pitch":12.5,
+            "view":{"type":"block"}}}
+```
+
+Chat snapshots and live `PLAYER` queries share the same target selection,
+including the active item's attack range and the ordinary block/entity pick.
+
+The bundle behind the id is the event-time context plus the full view ray - the
+server-side pick along the sender's eye line, computed from authoritative
+state, never from a client crosshair:
+
+```json
+{"view":{"type":"block","distance":3.1,"block":"minecraft:stone",
+         "pos":[10,63,0],"face":"north","hit":[10.5,63.5,-0.25]}}
+```
+
+The server vantage answers `CONTEXT` requests for it:
+
+| Request | Meaning |
+| --- | --- |
+| `CONTEXT <context_id>` | fetch the captured bundle by id |
+| `CONTEXT` | cache stats: capacity, ttlMillis, size, hits, misses, expired, evicted |
+
+```json
+{"type":"context","millis":...,"status":"ok","context_id":"ctx-2b1d...",
+ "ageMillis":842,"cache":{"capacity":256,"ttlMillis":300000,"size":3},
+ "context":{"schema":"player-context/1","context_id":"ctx-2b1d...","seq":12,
+            "capturedAt":1790343000000,"tick":8451,"timing":"receipt","uuid":"069a79f4-...",
+            "name":"Notch","dimension":"minecraft:overworld","x":10.5,"y":64.0,
+            "z":-3.25,"yaw":180.0,"pitch":12.5,
+            "view":{"type":"block","distance":3.1,"block":"minecraft:stone",
+                    "pos":[10,63,0],"face":"north","hit":[10.5,63.5,-0.25]}}}
+```
+
+Unknown and expired ids are structured and never return a different player's
+context:
+
+```json
+{"type":"context","status":"not_found","context_id":"ctx-nope","cache":{...}}
+{"type":"context","status":"expired","context_id":"ctx-2b1d...","capturedAt":1790343000000,
+ "ageMillis":4200000,"cache":{...}}
+```
+
+The cache holds at most 256 bundles for 300 seconds by default. When it is full
+the oldest bundle is evicted first; a lookup older than the TTL answers
+`expired` once and `not_found` afterwards, and an expired entry is dropped
+rather than served. Both limits are system properties (see Configuration).
+Receipt captures that never reach a broadcast are held for at most 60 seconds
+and use the same bound; only a bundle that was actually broadcast enters the
+cache, so junk packets cannot evict live context. If filtering outlives the
+receipt TTL, the event reports a structured unavailable context
+(`"reason":"receipt_expired"`) instead of silently substituting the later
+transform. Bundles contain server-known
+values only - identity, transform, one view ray, schema string - never an
+entity snapshot or a world save, so the chat event stays small. The server
+`CAPS` advertises `"context"` and `"events:chat"` for this.
+
 Entity records for players carry `name` (and `gameMode`), because a client
 cannot otherwise tell one player from another - and a Carpet fake player is
 just a player entity as far as the client is concerned.
 
 Per-tick samples are appended to `<gameDir>/mc-agent/samples.jsonl`.
+
+## Server vantage
+
+When it runs inside a server - a dedicated one or the integrated server of a
+single-player world - the mod also listens on `mcagent.serverPort` (`25581` by
+default, falling back to the next free port) and writes the actual port to
+`<mcagent.serverDir>/port.txt` (`mc-agent-server/` by default). Its `hello` says
+`"instance":"server"`, and its data is authoritative: requests are answered on
+the server thread.
+
+The server vantage speaks the same JSON-lines protocol as the client one, with
+the shared `STATE`, `ENTITIES`, `CMD`, `WAIT`, `MARK`, `CAPS` and `PING`
+requests plus:
+
+| Request | Meaning |
+| --- | --- |
+| `PLAYER <uuid\|name>` | one online player's server-known context and view target |
+| `SNAPSHOT [radius] [name]` / `SNAPSHOTS` | fork/list a live world (snapshot protocol) |
+
+### `PLAYER`
+
+`PLAYER` resolves one online player by stable UUID first (dashes optional) and
+by name as a convenience; `matchedBy` says which was used. The reply is the
+player's server-known state at request time:
+
+```json
+{"type":"player","instance":"server","protocol":1,"modVersion":"0.6.0",
+ "tick":104233,"query":"069a79f4-44e9-4726-a5be-fca90e38aaf5","found":true,
+ "matchedBy":"uuid",
+ "player":{"id":123,"uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5",
+   "type":"minecraft:player","name":"Notch","x":10.5,"y":64.0,"z":-3.25,
+   "vx":0.0,"vy":-0.0784,"vz":0.0,"yaw":180.0,"pitch":12.5,
+   "health":20.0,"maxHealth":20.0,"gameMode":"survival",
+   "dimension":"minecraft:overworld","eye":[10.5,65.62,-3.25],"onGround":true},
+ "view":{"eye":[10.5,65.62,-3.25],"direction":[0.0,0.216,0.976],
+   "blockRange":4.5,"entityRange":3.0,
+   "target":{"type":"block","hit":[10.5,65.5,-0.25],"distance":3.1,
+     "block":{"x":10,"y":65,"z":0,"id":"minecraft:stone","name":"Stone",
+       "face":"north","inside":false}}}}
+```
+
+The `player` object is the same record `ENTITIES` gives for a player (identity,
+position, velocity, rotation, health, game mode), with `dimension` and the eye
+position added. `view` adds the ray and its target, where `view.target.type` is
+one of:
+
+- `block` - carries `block.{x,y,z,id,name,face,inside}`;
+- `entity` - carries the same record `ENTITIES` gives, under `entity`;
+- `miss` - carries only `hit` and `distance`.
+
+The target is a server-side raycast from the player's eye position along the
+player's server-known look vector, run on the server thread when the request is
+handled. It has the same two stages as the vanilla 26.2 pick: an item carrying
+an attack range (the spears) selects first, then the ordinary block/entity pick
+with the player's interaction ranges is the fallback, with an out-of-reach hit
+becoming a miss. No client state is read: no crosshair, camera, screen or GUI.
+The same request therefore works with a dedicated server and with the
+integrated server of a single-player world.
+
+An unknown player is a structured answer, not an error and not a dropped
+connection:
+
+```json
+{"type":"player","instance":"server","found":false,
+ "query":"ghost","error":"no online player matches ghost"}
+```
+
+Server `CAPS` advertises `"player"` (resolve one player and return their
+context) and `"player:view"` (the server-side view-target raycast). The socket
+still binds to loopback only, so a co-located Toolkit reaches it exactly like
+the client socket and nothing becomes public.
 
 ## Build
 
@@ -84,8 +229,41 @@ python build.py \
   --jdk "C:/Program Files/Java/jdk-25"
 ```
 
-Output: `dist/mc-agent-interface-0.1.0.jar`. Put it together with
+Output: `dist/mc-agent-interface-0.6.0.jar`. Put it together with
 `fabric-api-*.jar` into the client's `mods/` directory.
+
+## Tests
+
+`test.py` compiles the mod and runs the dependency-free unit tests for the chat
+context cache and protocol shapes - capture/correlation, deterministic
+eviction, expiry, unknown ids and unavailable senders. It takes the same
+`--minecraft-dir`, `--version` and `--jdk` arguments as `build.py`:
+
+```bash
+python test.py \
+  --minecraft-dir "C:/Users/me/AppData/Roaming/.minecraft" \
+  --version 26.2-Fabric \
+  --jdk "C:/Program Files/Java/jdk-25"
+```
+
+`tests/player_context_test.py` is the protocol test for the server vantage. The
+default run never edits terrain and never deletes anything it did not create:
+it checks `CAPS`, an unknown player, and a valid player - an existing one with
+`--player`, otherwise a uniquely named Carpet fake probe that is removed
+afterwards:
+
+```bash
+python tests/player_context_test.py --port 25581 --player gua_jun
+```
+
+`--allow-world-edits` adds the server-raycast scenarios (block, entity, miss,
+and a spear's attack-range case). It clears and places blocks only inside a
+small documented box and tags its summoned fixture, but that box is still
+destructive: run this mode only against a disposable or isolated world.
+
+```bash
+python tests/player_context_test.py --port 25581 --allow-world-edits
+```
 
 ## Configuration
 
@@ -94,6 +272,10 @@ Output: `dist/mc-agent-interface-0.1.0.jar`. Put it together with
 | `mcagent.dir` | `<gameDir>/mc-agent` | directory for `port.txt`, event and sample files |
 | `mcagent.port` | `25580` | first port to try; the mod falls back to the next free port |
 | `mcagent.autoConnect` | unset | `host:port`; join that server from the title screen on startup |
+| `mcagent.serverDir` | `mc-agent-server` | server vantage: directory for `port.txt`, event and snapshot files |
+| `mcagent.serverPort` | `25581` | server vantage: first port to try |
+| `mcagent.contextCacheSize` | `256` | server vantage: chat context bundles kept in memory |
+| `mcagent.contextCacheTtlSeconds` | `300` | server vantage: how long a bundle stays fetchable after capture |
 
 ## In-game commands
 
