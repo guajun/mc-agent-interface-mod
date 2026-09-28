@@ -96,6 +96,12 @@ public final class ServerCore implements LineHandler {
     public void start() {
         sink.start();
         sink.addListener(socket::broadcast);
+        // Same-port control sessions are real InterfaceServer-shaped clients:
+        // without this they would advertise events:chat/events:game but never
+        // receive a pushed event.
+        if (SamePortControl.enabled()) {
+            sink.addListener(SamePortControl::broadcast);
+        }
         if (!socket.start()) {
             emitError("bind", "no free server port");
             return;
@@ -237,6 +243,9 @@ public final class ServerCore implements LineHandler {
             levels.add(entry);
         }
         object.add("levels", levels);
+        // Issue #7 evidence: what the experimental same-port control transport
+        // sees. Disabled builds report enabled=false and no sessions.
+        object.add("samePortSpike", SamePortControl.state());
         return object;
     }
 

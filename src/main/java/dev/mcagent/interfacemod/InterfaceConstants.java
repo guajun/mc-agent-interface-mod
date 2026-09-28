@@ -8,7 +8,7 @@ package dev.mcagent.interfacemod;
  */
 public final class InterfaceConstants {
     public static final String MOD_ID = "mc-agent-interface";
-    public static final String VERSION = "0.6.0";
+    public static final String VERSION = "0.7.0";
     public static final int PROTOCOL_VERSION = 1;
 
     public static final int DEFAULT_CLIENT_PORT = 25580;
@@ -26,6 +26,20 @@ public final class InterfaceConstants {
     public static final String CLIENT_CAPABILITIES =
             "[\"state\",\"entities\",\"command\",\"chat\",\"record\",\"wait\",\"screen\",\"mark\",\"connect\","
                     + "\"world\",\"lan\",\"events:chat\",\"events:game\"]";
+
+    /**
+     * Issue #7 spike: the ASCII marker a non-player control connection writes
+     * before the JSON-lines protocol, so it can be told apart from a vanilla
+     * Minecraft handshake on the game port. A vanilla handshake starts with a
+     * VarInt packet length and packet id 0x00; no valid handshake starts with
+     * {@code 'M' 'C'} followed by {@code 'A'}, because packet id 0x43 is not a
+     * handshake packet. This is a provisional spike marker, not the #8
+     * protocol.
+     */
+    public static final String SAME_PORT_MAGIC = "MCAGENT-CONTROL/1\n";
+
+    /** Transport name reported by the same-port spike's hello line. */
+    public static final String SAME_PORT_TRANSPORT = "same-port-spike";
 
     public static final String SERVER_CAPABILITIES =
             "[\"state\",\"entities\",\"player\",\"player:view\",\"command\",\"context\",\"wait\",\"mark\",\"snapshot\","

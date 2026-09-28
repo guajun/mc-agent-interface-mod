@@ -1,0 +1,424 @@
+{
+  "issue": "guajun/mc-agent-interface-mod#7",
+  "revision": "review-1 fixes (short-handshake framing, disconnect classification, world-save safety, event capability, honest LAN close wording)",
+  "recorded": "2026-09-28",
+  "environment": {
+    "minecraft": "26.2",
+    "fabric_loader": "0.19.5",
+    "fabric_api": "0.161.0+26.2",
+    "jdk": "Microsoft OpenJDK 25.0.1+8-LTS",
+    "os": "Windows 11 (RTX 3070 Laptop), Git Bash driver shell",
+    "go": "go1.26.4 windows/amd64",
+    "mod_jar": "dist/mc-agent-interface-0.7.0.jar",
+    "mod_jar_sha256": "0135d9bf88935e3e454dbda5f37b5d588575a2d61da0f7add87e8b6c1d4230f7",
+    "go_probe_sha256": "0362b6a243e46ea66512a21fc3e89cf0f4e92aea0dfdb757b96ce9eeeb48132c",
+    "mod_jar_sha256_note": "sha256 of the jar used for the recorded run; a rebuild is source-identical but not byte-identical because build.py does not normalise ZIP entry timestamps"
+  },
+  "dedicated": {
+    "lab": "issue7-dedicated",
+    "game_port": 54421,
+    "rcon_port": 54420,
+    "checks_passed": 30,
+    "checks_failed": 0,
+    "checks": [
+      {
+        "check": "vanilla status ping on the game port",
+        "ok": true,
+        "detail": "{\"name\": \"26.2\", \"protocol\": 776}"
+      },
+      {
+        "check": "vanilla status ping round-trip",
+        "ok": true,
+        "detail": "pong=72623859790382856"
+      },
+      {
+        "check": "short-host vanilla status handshake passes the sniffer",
+        "ok": true,
+        "detail": "{\"name\": \"26.2\", \"protocol\": 776}"
+      },
+      {
+        "check": "server announced Done",
+        "ok": true,
+        "detail": "no Done line in this run"
+      },
+      {
+        "check": "spike enabled in the server log",
+        "ok": true,
+        "detail": "opt-in line missing from this run"
+      },
+      {
+        "check": "RCON list before control shows no players",
+        "ok": true,
+        "detail": "There are 0 of a max of 8 players online: "
+      },
+      {
+        "check": "client mod accepted CONNECT",
+        "ok": true,
+        "detail": "{\"type\": \"connect_ack\", \"millis\": 1790582201903, \"detail\": \"127.0.0.1:54421\"}"
+      },
+      {
+        "check": "real client player joined the game",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "RCON list shows the real player",
+        "ok": true,
+        "detail": "There are 1 of a max of 8 players online: issue7-player"
+      },
+      {
+        "check": "real client player disconnected",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "RCON list after the real player left is empty",
+        "ok": true,
+        "detail": "There are 0 of a max of 8 players online: "
+      },
+      {
+        "check": "client mod accepted the reconnect",
+        "ok": true,
+        "detail": "{\"type\": \"connect_ack\", \"millis\": 1790582227509, \"detail\": \"127.0.0.1:54421\"}"
+      },
+      {
+        "check": "real client player reconnected",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "reconnecting player disconnected again",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "probe A succeeded end to end",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "probe B succeeded end to end",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "probe A spoke the spike transport",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "probe B spoke the spike transport",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "probe A saw two concurrent control sessions",
+        "ok": true,
+        "detail": "2"
+      },
+      {
+        "check": "probe B saw two concurrent control sessions",
+        "ok": true,
+        "detail": "2"
+      },
+      {
+        "check": "probe A closed and the server closed its side too",
+        "ok": true,
+        "detail": "True"
+      },
+      {
+        "check": "probe B closed and the server closed its side too",
+        "ok": true,
+        "detail": "True"
+      },
+      {
+        "check": "probes saw the real player online",
+        "ok": true,
+        "detail": "A=1 B=1"
+      },
+      {
+        "check": "probes saw the real player leave while control stayed connected",
+        "ok": true,
+        "detail": "players=0-1 sessions=2 polls=90"
+      },
+      {
+        "check": "no control session ever joined the game",
+        "ok": true,
+        "detail": ""
+      },
+      {
+        "check": "spike transport is observable in STATE",
+        "ok": true,
+        "detail": "{\"type\":\"state\",\"millis\":1790582184306,\"instance\":\"server\",\"protocol\":1,\"modVersion\":\"0.7.0\",\"tick\":22,\"inWorld\":true,\"levelName\":\"world\",\"worldDir\":\"F:\\\\mc-agent\\\\.worktrees\\\\artifacts\\\\issue-39\\\\lab"
+      },
+      {
+        "check": "hello advertises event streams and the session really receives one",
+        "ok": true,
+        "detail": "hello_events=True seen=['mark', 'mark', 'mark', 'mark']"
+      },
+      {
+        "check": "RCON list after all probes shows no players",
+        "ok": true,
+        "detail": "There are 0 of a max of 8 players online: "
+      },
+      {
+        "check": "stop probe completed hello/ping/STATE",
+        "ok": true,
+        "detail": "no state event within 30s"
+      },
+      {
+        "check": "graceful server stop closes the same-port control session",
+        "ok": true,
+        "detail": "{\"ok\": true, \"disconnected\": true, \"server_closed\": null, \"disconnect_error\": \"read tcp 127.0.0.1:57437->127.0.0.1:54421: wsarecv: An established connection was aborted by the software in your host machine.\"}"
+      }
+    ],
+    "probe_a": {
+      "ok": true,
+      "error": null,
+      "hello_transport": "same-port-spike",
+      "hello_port": 54421,
+      "ping": true,
+      "mark": true,
+      "control_sessions_max": 2,
+      "players_min": 0,
+      "players_max": 1,
+      "poll_count": 90,
+      "server_closed": true,
+      "disconnected": null,
+      "disconnect_error": null,
+      "events_seen": [
+        "mark",
+        "mark",
+        "mark",
+        "mark"
+      ],
+      "players_control_timeline": [
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          0,
+          1
+        ]
+      ]
+    },
+    "probe_b": {
+      "ok": true,
+      "error": null,
+      "hello_transport": "same-port-spike",
+      "hello_port": 54421,
+      "ping": true,
+      "mark": true,
+      "control_sessions_max": 2,
+      "players_min": 0,
+      "players_max": 1,
+      "poll_count": 87,
+      "server_closed": true,
+      "disconnected": null,
+      "disconnect_error": null,
+      "events_seen": [
+        "mark"
+      ],
+      "players_control_timeline": [
+        [
+          0,
+          2
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          0,
+          2
+        ]
+      ]
+    },
+    "probe_stop": {
+      "ok": true,
+      "error": null,
+      "hello_transport": "same-port-spike",
+      "hello_port": 54421,
+      "ping": true,
+      "mark": null,
+      "control_sessions_max": 1,
+      "players_min": 0,
+      "players_max": 0,
+      "poll_count": 0,
+      "server_closed": null,
+      "disconnected": true,
+      "disconnect_error": "read tcp 127.0.0.1:57437->127.0.0.1:54421: wsarecv: An established connection was aborted by the software in your host machine.",
+      "events_seen": [
+        "mark"
+      ],
+      "players_control_timeline": []
+    },
+    "player": "issue7-player",
+    "server_log_excerpt": [
+      "[15:56:20] [main/INFO]: [STDOUT]: [mc-agent-interface] same-port control spike ENABLED (experimental, unauthenticated): control sessions are accepted on the game TCP port. Loopback only unless -Dmcagent.samePortSpikeAllowRemote=true. Use only in isolated tests; authentication is #8.",
+      "[15:56:24] [Netty NIO IO #4/INFO]: [STDOUT]: [mc-agent-interface] same-port control session spike-1 accepted from /127.0.0.1:57358 (transport=same-port-spike, sessions=1)",
+      "[15:56:27] [Netty NIO IO #5/INFO]: [STDOUT]: [mc-agent-interface] same-port control session spike-2 accepted from /127.0.0.1:57361 (transport=same-port-spike, sessions=2)",
+      "[15:56:44] [Server thread/INFO]: issue7-player joined the game",
+      "[15:56:54] [Server thread/INFO]: issue7-player lost connection: Disconnected",
+      "[15:56:54] [Server thread/INFO]: issue7-player left the game",
+      "[15:57:10] [Server thread/INFO]: issue7-player joined the game",
+      "[15:57:18] [Server thread/INFO]: issue7-player lost connection: Disconnected",
+      "[15:57:18] [Server thread/INFO]: issue7-player left the game",
+      "[15:57:56] [Netty NIO IO #5/INFO]: [STDOUT]: [mc-agent-interface] same-port control session spike-2 (/127.0.0.1:57361) closed: write failed: io.netty.channel.StacklessClosedChannelException; sessions=1",
+      "[15:57:56] [Netty NIO IO #4/INFO]: [STDOUT]: [mc-agent-interface] same-port control session spike-1 (/127.0.0.1:57358) closed: channel closed by peer; sessions=0",
+      "[15:57:57] [Netty NIO IO #8/INFO]: [STDOUT]: [mc-agent-interface] same-port control session spike-3 accepted from /127.0.0.1:57437 (transport=same-port-spike, sessions=1)",
+      "[15:57:57] [Server thread/INFO]: [STDOUT]: [mc-agent-interface] same-port control session spike-3 (/127.0.0.1:57437) closed: server stopping; sessions=0"
+    ]
+  },
+  "lan": {
+    "first_port": 25565,
+    "second_port": 25566,
+    "close_path": "host process termination (abrupt); in-game world close / same-process reopen not verified",
+    "checks_passed": 11,
+    "checks_failed": 0,
+    "checks": [
+      {
+        "check": "LAN first published on the requested port 25565",
+        "ok": true,
+        "detail": "{'type': 'lan_ack', 'millis': 1790582314080, 'detail': 'port=25565 address=localhost gamemode=survival cheats=false online=false'}"
+      },
+      {
+        "check": "LAN first probe completed hello/ping/STATE",
+        "ok": true,
+        "detail": "no state event within 40s"
+      },
+      {
+        "check": "host process termination disconnected the control connection",
+        "ok": true,
+        "detail": "\"write tcp 127.0.0.1:57695->127.0.0.1:25565: wsasend: An existing connection was forcibly closed by the remote host.\""
+      },
+      {
+        "check": "first LAN port is no longer listening after the host process died",
+        "ok": true,
+        "detail": "port 25565 still answers"
+      },
+      {
+        "check": "LAN first probe reached the actual LAN port 25565",
+        "ok": true,
+        "detail": "hello_port=25565"
+      },
+      {
+        "check": "LAN first host player is in control STATE",
+        "ok": true,
+        "detail": "['issue7-host']"
+      },
+      {
+        "check": "LAN second published on the requested port 25566",
+        "ok": true,
+        "detail": "{'type': 'lan_ack', 'millis': 1790582339494, 'detail': 'port=25566 address=localhost gamemode=survival cheats=false online=false'}"
+      },
+      {
+        "check": "LAN second probe completed hello/ping/STATE",
+        "ok": true,
+        "detail": "no state event within 40s"
+      },
+      {
+        "check": "a control connection can close cleanly while the LAN world stays open",
+        "ok": true,
+        "detail": "True"
+      },
+      {
+        "check": "LAN second probe reached the actual LAN port 25566",
+        "ok": true,
+        "detail": "hello_port=25566"
+      },
+      {
+        "check": "LAN second host player is in control STATE",
+        "ok": true,
+        "detail": "['issue7-host']"
+      }
+    ],
+    "first_probe": {
+      "ok": true,
+      "error": null,
+      "hello_transport": "same-port-spike",
+      "hello_port": 25565,
+      "ping": true,
+      "mark": null,
+      "control_sessions_max": 1,
+      "players_min": 1,
+      "players_max": 1,
+      "poll_count": 1,
+      "server_closed": null,
+      "disconnected": true,
+      "disconnect_error": "write tcp 127.0.0.1:57695->127.0.0.1:25565: wsasend: An existing connection was forcibly closed by the remote host.",
+      "events_seen": [
+        "mark"
+      ],
+      "players_control_timeline": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ]
+    },
+    "second_probe": {
+      "ok": true,
+      "error": null,
+      "hello_transport": "same-port-spike",
+      "hello_port": 25566,
+      "ping": true,
+      "mark": true,
+      "control_sessions_max": 1,
+      "players_min": 1,
+      "players_max": 1,
+      "poll_count": 20,
+      "server_closed": true,
+      "disconnected": null,
+      "disconnect_error": null,
+      "events_seen": [
+        "mark"
+      ],
+      "players_control_timeline": [
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ]
+    },
+    "client_log_excerpt": [
+      "[15:42:53] [Server thread/INFO]: issue7-host joined the game",
+      "[15:42:54] [Render thread/INFO]: Published LAN server on port 25566",
+      "[15:58:24] [Render thread/INFO]: [STDOUT]: [mc-agent-interface] same-port control spike ENABLED (experimental, unauthenticated): control sessions are accepted on the game TCP port. Loopback only unless -Dmcagent.samePortSpikeAllowRemote=true. Use only in isolated tests; authentication is #8.",
+      "[15:58:32] [Server thread/INFO]: issue7-host joined the game",
+      "[15:58:34] [Render thread/INFO]: Published LAN server on port 25565",
+      "[15:58:49] [Render thread/INFO]: [STDOUT]: [mc-agent-interface] same-port control spike ENABLED (experimental, unauthenticated): control sessions are accepted on the game TCP port. Loopback only unless -Dmcagent.samePortSpikeAllowRemote=true. Use only in isolated tests; authentication is #8.",
+      "[15:58:58] [Server thread/INFO]: issue7-host joined the game",
+      "[15:58:59] [Render thread/INFO]: Published LAN server on port 25566"
+    ]
+  }
+}

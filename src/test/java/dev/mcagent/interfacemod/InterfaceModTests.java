@@ -1,14 +1,23 @@
 package dev.mcagent.interfacemod;
 
 import com.google.gson.JsonObject;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.embedded.EmbeddedChannel;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.LastSeenMessages;
 import net.minecraft.network.chat.PlayerChatMessage;
 import net.minecraft.network.chat.SignedMessageBody;
 import net.minecraft.network.chat.SignedMessageChain;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Dependency-free unit tests for the chat context protocol and its cache.
@@ -40,6 +49,8 @@ public final class InterfaceModTests {
         broadcastFallbackIsLabelled();
         publicationIsStructuredWithoutReceipts();
         unsignedReceiptKeySurvivesFiltering();
+        samePortMarkerIsDistinctFromVanillaHandshakes();
+        samePortSnifferFramesShortAndFragmentedTraffic();
         System.out.println("all " + checks + " checks passed");
     }
 
@@ -331,6 +342,181 @@ public final class InterfaceModTests {
         PlayerChatMessage filtered = first.withUnsignedContent(Component.literal("first")).filter(true);
         check(firstKey.equals(ServerCore.receiptKey(filtered)),
                 "the receipt key survives withUnsignedContent and filter");
+    }
+
+    /**
+     * The issue #7 same-port marker must not collide with the start of a
+     * vanilla handshake. Vanilla begins with a VarInt frame length and packet
+     * id 0x00; the marker begins with 'M' 'C' and the third byte would be
+     * packet id 0x41, which is not a handshake packet.
+     */
+    private static void samePortMarkerIsDistinctFromVanillaHandshakes() {
+        byte[] marker = (InterfaceConstants.SAME_PORT_MAGIC).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        check(SamePortControl.matchesMagic(marker), "the marker matches itself");
+        check(InterfaceConstants.SAME_PORT_MAGIC.length() == 18,
+                "the marker is 17 characters plus the newline, 18 bytes");
+
+        byte[] shortPrefix = new byte[] {'M', 'C'};
+        check(!SamePortControl.matchesMagic(shortPrefix), "a short prefix is not a marker");
+        check(!SamePortControl.matchesMagic(null), "null is not a marker");
+
+        byte[] lowercase = "mcagent-control/1\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        check(!SamePortControl.matchesMagic(lowercase), "the marker is case sensitive");
+
+        byte[] vanillaStatus = new byte[] {0x10, 0x00, 0x7F, 0x09, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't',
+                (byte) 0xDD, 0x3D, 0x01, 0x01, 0x00};
+        check(!SamePortControl.matchesMagic(vanillaStatus), "a vanilla status handshake is not a marker");
+
+        byte[] vanillaLogin = new byte[] {0x11, 0x00, 0x76, 0x09, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't',
+                (byte) 0xDD, 0x3D, 0x02, 0x10, 'P', 'l', 'a', 'y'};
+        check(!SamePortControl.matchesMagic(vanillaLogin), "a vanilla login handshake is not a marker");
+    }
+
+    /**
+     * Netty-level checks for the issue #7 sniffer. The first review found that
+     * a valid short status handshake (10 bytes for a one-character host) was
+     * held until the marker length arrived, stalling a normal client; these
+     * tests pin the fixed framing: decide on the first non-marker byte, replay
+     * every buffered byte, accept a fragmented marker, and keep the deadline
+     * behaviour exact.
+     */
+    private static void samePortSnifferFramesShortAndFragmentedTraffic() {
+        String previousEnabled = System.getProperty(SamePortControl.PROPERTY_ENABLED);
+        String previousDeadline = System.getProperty(SamePortControl.PROPERTY_HANDSHAKE_SECONDS);
+        System.setProperty(SamePortControl.PROPERTY_ENABLED, "true");
+        System.setProperty(SamePortControl.PROPERTY_HANDSHAKE_SECONDS, "5");
+        try {
+            shortVanillaHandshakePassesThroughImmediately();
+            fragmentedVanillaHandshakeKeepsEveryByte();
+            markerPrefixThenMismatchPassesThrough();
+            fragmentedMarkerIsAdoptedAndControlBytesFlow();
+            mismatchCancelsTheHandshakeDeadline();
+            undecidedConnectionHitsTheHandshakeDeadline();
+        } finally {
+            SamePortControl.closeAll("test cleanup");
+            restoreProperty(SamePortControl.PROPERTY_ENABLED, previousEnabled);
+            restoreProperty(SamePortControl.PROPERTY_HANDSHAKE_SECONDS, previousDeadline);
+        }
+    }
+
+    private static void shortVanillaHandshakePassesThroughImmediately() {
+        EmbeddedChannel channel = armedLoopbackChannel();
+        // Handshake (protocol 0, host "a", status intention: frame length 0x07)
+        // plus the status request (0x01 0x00): 10 bytes total, shorter than the
+        // marker (17 characters plus the newline, 18 bytes).
+        byte[] handshake = {0x07, 0x00, 0x00, 0x01, 'a', (byte) 0xDD, 0x3D, 0x01, 0x01, 0x00};
+        channel.writeInbound(Unpooled.copiedBuffer(handshake));
+        ByteBuf forwarded = channel.readInbound();
+        check(forwarded != null, "a short vanilla handshake is forwarded at once");
+        check(Arrays.equals(drain(forwarded), handshake), "the short handshake bytes are unchanged");
+        check(channel.readOutbound() == null, "a short handshake never gets a control hello");
+        channel.finishAndReleaseAll();
+    }
+
+    private static void fragmentedVanillaHandshakeKeepsEveryByte() {
+        EmbeddedChannel channel = armedLoopbackChannel();
+        byte[] head = {0x10};
+        byte[] tail = {0x00, 0x7F, 0x09, 'l'};
+        channel.writeInbound(Unpooled.copiedBuffer(head));
+        ByteBuf first = channel.readInbound();
+        check(first != null && Arrays.equals(drain(first), head), "the first vanilla fragment is forwarded");
+        channel.writeInbound(Unpooled.copiedBuffer(tail));
+        ByteBuf second = channel.readInbound();
+        check(second != null && Arrays.equals(drain(second), tail),
+                "later fragments of ordinary traffic are forwarded unchanged");
+        channel.finishAndReleaseAll();
+    }
+
+    private static void markerPrefixThenMismatchPassesThrough() {
+        EmbeddedChannel channel = armedLoopbackChannel();
+        channel.writeInbound(Unpooled.copiedBuffer("MCAGENT".getBytes(StandardCharsets.US_ASCII)));
+        check(channel.readInbound() == null, "a strict marker prefix waits for more bytes");
+        channel.writeInbound(Unpooled.copiedBuffer("X".getBytes(StandardCharsets.US_ASCII)));
+        ByteBuf forwarded = channel.readInbound();
+        check(forwarded != null && Arrays.equals(drain(forwarded),
+                "MCAGENTX".getBytes(StandardCharsets.US_ASCII)), "a mismatching prefix is replayed byte for byte");
+        check(channel.readOutbound() == null, "a mismatching prefix never adopts the connection");
+        channel.finishAndReleaseAll();
+    }
+
+    private static void fragmentedMarkerIsAdoptedAndControlBytesFlow() {
+        EmbeddedChannel channel = armedLoopbackChannel();
+        channel.writeInbound(Unpooled.copiedBuffer("MCAG".getBytes(StandardCharsets.US_ASCII)));
+        check(channel.readInbound() == null, "a marker prefix waits instead of deciding");
+        check(channel.readOutbound() == null, "no hello before the marker completes");
+        channel.writeInbound(Unpooled.copiedBuffer("ENT-CONTROL/1\n".getBytes(StandardCharsets.US_ASCII)));
+        ByteBuf hello = channel.readOutbound();
+        check(hello != null, "a fragmented marker is still recognized");
+        String helloLine = hello == null ? "" : hello.toString(StandardCharsets.UTF_8);
+        if (hello != null) {
+            hello.release();
+        }
+        check(helloLine.contains("\"transport\":\"same-port-spike\""),
+                "the hello names the spike transport");
+        channel.writeInbound(Unpooled.copiedBuffer("PING\n".getBytes(StandardCharsets.US_ASCII)));
+        ByteBuf reply = channel.readOutbound();
+        check(reply != null, "bytes after the marker stay on the control session");
+        String replyLine = reply == null ? "" : reply.toString(StandardCharsets.UTF_8);
+        if (reply != null) {
+            reply.release();
+        }
+        check(replyLine.contains("server vantage is not ready"),
+                "the control line reaches the LineHandler slot");
+        channel.finishAndReleaseAll();
+    }
+
+    private static void mismatchCancelsTheHandshakeDeadline() {
+        EmbeddedChannel channel = armedLoopbackChannel();
+        channel.writeInbound(Unpooled.copiedBuffer(new byte[] {0x10}));
+        ByteBuf forwarded = channel.readInbound();
+        check(forwarded != null, "the mismatching byte reaches the vanilla path before the deadline");
+        drain(forwarded);
+        channel.advanceTimeBy(6, TimeUnit.SECONDS);
+        channel.runScheduledPendingTasks();
+        check(channel.isOpen(), "a mismatch cancels the handshake deadline instead of closing later");
+        channel.finishAndReleaseAll();
+    }
+
+    private static void undecidedConnectionHitsTheHandshakeDeadline() {
+        EmbeddedChannel channel = armedLoopbackChannel();
+        channel.advanceTimeBy(6, TimeUnit.SECONDS);
+        channel.runScheduledPendingTasks();
+        check(!channel.isOpen(), "an undecided connection is closed by the handshake deadline");
+        channel.finishAndReleaseAll();
+    }
+
+    private static EmbeddedChannel armedLoopbackChannel() {
+        EmbeddedChannel channel = new LoopbackChannel();
+        SamePortControl.armChannel(channel.pipeline(), null);
+        return channel;
+    }
+
+    private static byte[] drain(ByteBuf buffer) {
+        byte[] bytes = new byte[buffer.readableBytes()];
+        buffer.readBytes(bytes);
+        buffer.release();
+        return bytes;
+    }
+
+    private static void restoreProperty(String key, String previous) {
+        if (previous == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, previous);
+        }
+    }
+
+    /** An embedded channel with a loopback peer, so adoption is not refused. */
+    private static final class LoopbackChannel extends EmbeddedChannel {
+        @Override
+        protected SocketAddress localAddress0() {
+            return new InetSocketAddress(InetAddress.getLoopbackAddress(), 25565);
+        }
+
+        @Override
+        protected SocketAddress remoteAddress0() {
+            return new InetSocketAddress(InetAddress.getLoopbackAddress(), 41000);
+        }
     }
 
     private static PlayerContext context(long seq, String id, long capturedAt, String uuid, String name) {
