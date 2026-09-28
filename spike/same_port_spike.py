@@ -70,19 +70,23 @@ class Cleanup:
 
     INSTANCES: list["Cleanup"] = []
 
-    def __init__(self, lab_module, lab_name: str) -> None:
+    def __init__(self, lab_module, lab_name: str, keep: bool = False) -> None:
         self.lab_module = lab_module
         self.lab_name = lab_name
+        self.keep = keep
         self.lab_running = False
         self.processes: list[subprocess.Popen] = []
         Cleanup.INSTANCES.append(self)
 
     def track(self, process: subprocess.Popen) -> subprocess.Popen:
+        """Register a process this run owns, immediately after spawning it."""
         self.processes.append(process)
         return process
 
     def stop_lab(self) -> None:
-        if not self.lab_running:
+        # --keep is a promise: a run that was asked to leave the lab server up
+        # must not stop it on success or on failure.
+        if self.keep or not self.lab_running:
             return
         self.lab_running = False
         try:
@@ -307,7 +311,7 @@ def scenario_dedicated(args) -> int:
         name=args.lab_name, mc="", fabric_api=True, carpet=False, mod_jar=[str(mod_jar)],
         mod_url=[], world="", void=True, java=args.jdk25, memory="", loader="", force=False))
     lab, state = lab_module.load_lab(args.lab_name)
-    guard = Cleanup(lab_module, args.lab_name)
+    guard = Cleanup(lab_module, args.lab_name, keep=args.keep)
     game_port = int(state["serverPort"])
     rcon_port = int(state["rconPort"])
     console_log = lab / "logs" / "console.log"
@@ -316,9 +320,11 @@ def scenario_dedicated(args) -> int:
     env = dict(os.environ, JAVA_TOOL_OPTIONS="-Dmcagent.samePortSpike=true")
     previous_env = os.environ.copy()
     os.environ.update(env)
+    # Register the lab before starting it: cmd_start can time out with a JVM
+    # already spawned, and that JVM must still be stopped on the failure path.
+    guard.lab_running = True
     try:
         lab_module.cmd_start(SimpleNamespace(name=args.lab_name, java=args.jdk25, memory="", wait=300))
-        guard.lab_running = True
     finally:
         os.environ.clear()
         os.environ.update(previous_env)
@@ -552,8 +558,10 @@ def wait_for_client(game_dir: Path, timeout: float) -> None:
 
 
 def open_world_and_lan(args, game_dir: Path, client_log: Path, world_name: str,
-                       lan_port: int, username: str):
-    client = launch_client(args, game_dir, client_log, username)
+                       lan_port: int, username: str, guard: "Cleanup"):
+    # Track immediately: the readiness wait below can fail and must still leave
+    # the already-spawned client JVM in the cleanup set.
+    client = guard.track(launch_client(args, game_dir, client_log, username))
     wait_for_client(game_dir, args.client_wait)
     # The title screen must be idle before WORLD is accepted.
     deadline = time.monotonic() + args.client_wait
@@ -588,12 +596,12 @@ def scenario_lan(args) -> int:
         name=args.lab_name, mc="", fabric_api=True, carpet=False, mod_jar=[str(mod_jar)],
         mod_url=[], world="", void=True, java=args.jdk25, memory="", loader="", force=False))
     lab, state = lab_module.load_lab(args.lab_name)
-    guard = Cleanup(lab_module, args.lab_name)
+    guard = Cleanup(lab_module, args.lab_name, keep=args.keep)
     previous_env = os.environ.copy()
     os.environ["JAVA_TOOL_OPTIONS"] = "-Dmcagent.samePortSpike=true"
+    guard.lab_running = True
     try:
         lab_module.cmd_start(SimpleNamespace(name=args.lab_name, java=args.jdk25, memory="", wait=300))
-        guard.lab_running = True
     finally:
         os.environ.clear()
         os.environ.update(previous_env)
@@ -608,8 +616,8 @@ def scenario_lan(args) -> int:
     client_log = game_dir / "logs" / "latest.log"
 
     def attempt(port: int, tag: str, hold: float, close_world: bool) -> dict:
-        client, reply = open_world_and_lan(args, game_dir, console_log, args.world_name, port, args.client_username)
-        guard.track(client)
+        client, reply = open_world_and_lan(args, game_dir, console_log, args.world_name, port,
+                                           args.client_username, guard)
         detail = reply.get("detail", "")
         actual_port = int(detail.split("port=")[1].split()[0]) if "port=" in detail else port
         check(f"LAN {tag} published on the requested port {port}", actual_port == port, str(reply))
@@ -724,7 +732,7 @@ def main() -> int:
                      help="launcher game root with versions/ and libraries/")
     lan.add_argument("--version", default="26.2-Fabric")
     lan.add_argument("--game-dir", type=Path, required=True)
-    lan.add_argument("--world-name", default="issue7-lan") 
+    lan.add_argument("--world-name", default="issue7-lan")
     lan.add_argument("--force-world", action="store_true",
                      help="allow replacing an existing save under game-dir/saves (default: refuse)")
     lan.add_argument("--lan-port", type=int, default=25565)

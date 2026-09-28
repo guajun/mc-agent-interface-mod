@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"syscall"
 )
 
 // isDisconnect reports whether err is a peer-caused termination of the
@@ -16,6 +15,11 @@ import (
 // JSON, an unexpected packet type or a local write failure against a live
 // socket are probe failures, not evidence that the world closed, so
 // -disconnect-ok must not turn them into ok=true.
+//
+// The text fallback exists only for raw platform socket errors that Go does
+// not expose as errno constants. It is therefore restricted to a
+// *net.OpError's underlying system error, never to our own protocol messages
+// that might quote "connection reset" as data.
 func isDisconnect(err error) bool {
 	if err == nil {
 		return false
@@ -36,28 +40,26 @@ func isDisconnect(err error) bool {
 			return true
 		}
 	}
-	text := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"forcibly closed",
-		"connection reset",
-		"connection aborted",
-		"broken pipe",
-		"was aborted",
-	} {
-		if strings.Contains(text, marker) {
-			return true
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Err != nil {
+		text := strings.ToLower(opErr.Err.Error())
+		for _, marker := range []string{
+			"forcibly closed",
+			"connection reset",
+			"connection aborted",
+			"broken pipe",
+			"was aborted",
+		} {
+			if strings.Contains(text, marker) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// resetErrors lists the portable errno values; Go defines these on Windows
-// too, and the human-readable fallback in isDisconnect covers raw WSA codes.
+// resetErrors returns the platform-specific errno values that mean the peer or
+// the network tore the connection down.
 func resetErrors() []error {
-	return []error{
-		syscall.ECONNRESET,
-		syscall.ECONNABORTED,
-		syscall.EPIPE,
-		syscall.ENOTCONN,
-	}
+	return platformResetErrors()
 }

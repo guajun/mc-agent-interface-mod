@@ -353,6 +353,8 @@ public final class InterfaceModTests {
     private static void samePortMarkerIsDistinctFromVanillaHandshakes() {
         byte[] marker = (InterfaceConstants.SAME_PORT_MAGIC).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
         check(SamePortControl.matchesMagic(marker), "the marker matches itself");
+        check(InterfaceConstants.SAME_PORT_MAGIC.length() == 18,
+                "the marker is 17 characters plus the newline, 18 bytes");
 
         byte[] shortPrefix = new byte[] {'M', 'C'};
         check(!SamePortControl.matchesMagic(shortPrefix), "a short prefix is not a marker");
@@ -399,9 +401,10 @@ public final class InterfaceModTests {
 
     private static void shortVanillaHandshakePassesThroughImmediately() {
         EmbeddedChannel channel = armedLoopbackChannel();
-        // Handshake (protocol 0, host "a", status intention) plus the status
-        // request: 10 bytes, shorter than the 18-byte marker.
-        byte[] handshake = {0x08, 0x00, 0x00, 0x01, 'a', (byte) 0xDD, 0x3D, 0x01, 0x01, 0x00};
+        // Handshake (protocol 0, host "a", status intention: frame length 0x07)
+        // plus the status request (0x01 0x00): 10 bytes total, shorter than the
+        // marker (17 characters plus the newline, 18 bytes).
+        byte[] handshake = {0x07, 0x00, 0x00, 0x01, 'a', (byte) 0xDD, 0x3D, 0x01, 0x01, 0x00};
         channel.writeInbound(Unpooled.copiedBuffer(handshake));
         ByteBuf forwarded = channel.readInbound();
         check(forwarded != null, "a short vanilla handshake is forwarded at once");

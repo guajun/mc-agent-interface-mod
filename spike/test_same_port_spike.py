@@ -13,7 +13,10 @@ cleans up only its own partial target.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -109,6 +112,64 @@ class PrepareWorldTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             driver.prepare_lan_world(empty_lab, self.game, "issue7-lan")
         self.assertFalse((self.game / "saves" / "issue7-lan").exists())
+
+
+class FakeLab:
+    def __init__(self):
+        self.stops = 0
+
+    def cmd_stop(self, namespace):
+        self.stops += 1
+
+
+class CleanupTests(unittest.TestCase):
+    """Review item 2: registration timing, ownership and --keep semantics."""
+
+    def spawn_sleeper(self) -> subprocess.Popen:
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+    def discard(self, guard, process) -> None:
+        if process.poll() is None:
+            process.kill()
+        if guard in driver.Cleanup.INSTANCES:
+            driver.Cleanup.INSTANCES.remove(guard)
+
+    def test_close_reaps_owned_processes_and_stops_the_lab(self):
+        lab = FakeLab()
+        guard = driver.Cleanup(lab, "test-lab")
+        process = guard.track(self.spawn_sleeper())
+        guard.lab_running = True
+        try:
+            guard.close()
+            process.wait(timeout=10)
+            self.assertIsNotNone(process.poll(), "a tracked process must be terminated")
+            self.assertEqual(lab.stops, 1, "a running lab must be stopped exactly once")
+        finally:
+            self.discard(guard, process)
+
+    def test_keep_leaves_the_lab_running_but_still_reaps_processes(self):
+        lab = FakeLab()
+        guard = driver.Cleanup(lab, "test-lab", keep=True)
+        process = guard.track(self.spawn_sleeper())
+        guard.lab_running = True
+        try:
+            guard.close()
+            process.wait(timeout=10)
+            self.assertIsNotNone(process.poll(), "clients/probes are terminated even with --keep")
+            self.assertEqual(lab.stops, 0, "--keep must keep the lab server running")
+        finally:
+            self.discard(guard, process)
+
+    def test_untracked_processes_are_never_touched(self):
+        lab = FakeLab()
+        guard = driver.Cleanup(lab, "test-lab")
+        other = self.spawn_sleeper()
+        try:
+            guard.close()
+            time.sleep(0.3)
+            self.assertIsNone(other.poll(), "the guard must only clean up processes it owns")
+        finally:
+            self.discard(guard, other)
 
 
 if __name__ == "__main__":
