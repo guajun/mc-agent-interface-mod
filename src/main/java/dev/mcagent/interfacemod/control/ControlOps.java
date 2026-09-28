@@ -33,12 +33,12 @@ public interface ControlOps {
 
     /**
      * One request's reply channel. Exactly one of {@code ok}/{@code fail} is
-     * called, at most once; {@code started} is called the moment the operation
-     * really begins on the game thread, so a timeout can tell "never ran, safe
-     * to retry" from "ran, result unknown".
+     * called, at most once; {@code started} claims the operation on the game
+     * thread and returns false when the request was cancelled before it began,
+     * in which case the operation must not execute.
      */
     interface Reply {
-        void started();
+        boolean started();
 
         void ok(JsonElement result);
 

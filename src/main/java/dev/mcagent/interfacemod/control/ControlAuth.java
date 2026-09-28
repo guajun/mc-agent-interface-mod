@@ -17,6 +17,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -166,10 +167,16 @@ public final class ControlAuth {
         return file;
     }
 
-    /** Load the file if it exists; a missing file is an empty store, not an error. */
+    /** Load the file if it exists; a missing file is an empty store, not an error.
+     *
+     * <p>The parse is atomic: a malformed file leaves the previous store in
+     * place and throws, so a bad reload cannot silently drop or replace live
+     * credentials.
+     */
     public synchronized LoadReport load() throws IOException {
-        tokens.clear();
+        Map<String, StoredToken> parsed = new ConcurrentHashMap<>();
         if (!Files.isRegularFile(file)) {
+            tokens.clear();
             return new LoadReport(true, 0, List.of());
         }
         String text = Files.readString(file, StandardCharsets.UTF_8);
@@ -177,7 +184,7 @@ public final class ControlAuth {
         try {
             root = JsonParser.parseString(text).getAsJsonObject();
         } catch (RuntimeException exception) {
-            throw new IOException("control token file is not valid JSON: " + file);
+            throw new IOException("control token file is not valid JSON (previous credentials kept): " + file);
         }
         JsonArray array = root.has("tokens") ? root.getAsJsonArray("tokens") : new JsonArray();
         int loaded = 0;
@@ -198,39 +205,59 @@ public final class ControlAuth {
                         ? object.get("expiresAtMillis").getAsLong() : null;
                 boolean revoked = object.has("revoked") && object.get("revoked").getAsBoolean();
                 Entry entry = new Entry(id, label, permissions, createdAt, expiresAt, revoked);
-                tokens.put(id, new StoredToken(entry, salt, hash));
+                parsed.put(id, new StoredToken(entry, salt, hash));
                 loaded++;
             } catch (RuntimeException exception) {
                 // One malformed row must not take down the whole file.
                 System.err.println("[mc-agent-interface] skipping malformed control token entry: " + exception);
             }
         }
+        tokens.clear();
+        tokens.putAll(parsed);
         return new LoadReport(false, loaded, List.of());
+    }
+
+    /** Live view of one stored credential, without revealing the secret. */
+    public synchronized Entry entry(String id) {
+        StoredToken stored = tokens.get(id);
+        return stored == null ? null : stored.entry;
     }
 
     /**
      * Reload the file and report which token ids changed state in a way that
-     * must close live sessions: removed, revoked or expired tokens.
+     * must close live sessions: removed, revoked, expired, or a permissions or
+     * expiry change. A parse failure propagates and keeps the old store.
      */
     public synchronized List<String> reloadAndFindRevoked() throws IOException {
-        Set<String> before = new LinkedHashSet<>(tokens.keySet());
-        Set<String> previouslyUsable = new LinkedHashSet<>();
+        Map<String, Entry> previouslyUsable = new LinkedHashMap<>();
         for (Map.Entry<String, StoredToken> entry : tokens.entrySet()) {
             StoredToken stored = entry.getValue();
             if (!stored.entry.revoked && !expired(stored.entry, System.currentTimeMillis())) {
-                previouslyUsable.add(entry.getKey());
+                previouslyUsable.put(entry.getKey(), stored.entry);
             }
         }
+        List<String> beforeIds = new ArrayList<>(tokens.keySet());
         load();
         List<String> affected = new ArrayList<>();
-        for (String id : before) {
-            if (!previouslyUsable.contains(id)) {
+        for (String id : beforeIds) {
+            StoredToken stored = tokens.get(id);
+            if (stored == null) {
+                if (previouslyUsable.containsKey(id)) {
+                    affected.add(id);
+                }
                 continue;
             }
-            StoredToken stored = tokens.get(id);
-            if (stored == null || stored.entry.revoked
-                    || expired(stored.entry, System.currentTimeMillis())
-                    || stored.entry.permissions.isEmpty()) {
+            Entry previous = previouslyUsable.get(id);
+            if (previous == null) {
+                continue; // was not usable before; nothing live to close
+            }
+            Entry current = stored.entry;
+            boolean changed = current.revoked
+                    || expired(current, System.currentTimeMillis())
+                    || current.permissions.isEmpty()
+                    || !current.permissions.equals(previous.permissions)
+                    || !java.util.Objects.equals(current.expiresAtMillis, previous.expiresAtMillis);
+            if (changed) {
                 affected.add(id);
             }
         }

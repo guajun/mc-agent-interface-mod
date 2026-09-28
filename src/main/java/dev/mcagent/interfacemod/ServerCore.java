@@ -1,6 +1,7 @@
 package dev.mcagent.interfacemod;
 
 import dev.mcagent.interfacemod.control.ControlOps;
+import dev.mcagent.interfacemod.control.ControlPaths;
 import dev.mcagent.interfacemod.control.ControlServer;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -134,6 +135,9 @@ public final class ServerCore implements LineHandler, ControlOps {
                 wait.reply.accept(ack("wait", "ticks=0").toString());
             }
         }
+        // Live credential expiry/revocation: sessions whose token is no
+        // longer valid are closed even if they never send another request.
+        ControlServer.expireSessionsNow();
     }
 
     // ------------------------------------------------------------------ control
@@ -149,7 +153,12 @@ public final class ServerCore implements LineHandler, ControlOps {
         JsonObject safe = params == null ? new JsonObject() : params;
         try {
             server.execute(() -> {
-                reply.started();
+                // Claim the operation on the game thread; a request cancelled
+                // while it was queued (timeout or disconnect) returns false and
+                // must not run after the client was told it is safe to retry.
+                if (!reply.started()) {
+                    return;
+                }
                 try {
                     runControlOperation(operation, safe, reply);
                 } catch (Throwable throwable) {
@@ -194,7 +203,8 @@ public final class ServerCore implements LineHandler, ControlOps {
                     reply.fail("bad_request", "command must not be empty", false, false);
                     return;
                 }
-                runCommand(oneLine(command), lineReply(reply));
+                runCommand(oneLine(command), lineReply(reply),
+                        net.minecraft.server.permissions.LevelBasedPermissionSet.ADMIN);
             }
             case "mark" -> {
                 String text = oneLine(stringParam(params, "text"));
@@ -764,6 +774,23 @@ public final class ServerCore implements LineHandler, ControlOps {
     }
 
     private void runCommand(String command, Consumer<String> reply) {
+        runCommand(command, reply, null);
+    }
+
+    /**
+     * Execute a game command.
+     *
+     * <p>A control-transport write passes {@code permission = ADMIN}: the
+     * remote credential may run ordinary game commands but not owner-level
+     * administration. Credential management ({@code /mcagent control token ...})
+     * requires OWNER, so a remote write cannot mint or revoke credentials, and
+     * `/execute run`, `/execute as` and `/function` inherit the same source and
+     * cannot elevate it. The local legacy loopback adapter keeps the full
+     * owner-level source because it is bound to the machine that already owns
+     * the server console.
+     */
+    private void runCommand(String command, Consumer<String> reply,
+                            net.minecraft.server.permissions.PermissionSet permission) {
         List<String> lines = new ArrayList<>();
         CommandSource collecting = new CommandSource() {
             @Override
@@ -787,6 +814,11 @@ public final class ServerCore implements LineHandler, ControlOps {
             }
         };
         CommandSourceStack source = server.createCommandSourceStack().withSource(collecting);
+        if (permission != null) {
+            // withPermission replaces the set rather than adding to it, so the
+            // remote source really is capped below owner level.
+            source = source.withPermission(permission);
+        }
         String normalized = command.startsWith("/") ? command.substring(1) : command;
         server.getCommands().performPrefixedCommand(source, normalized);
         JsonObject answer = ack("cmd", normalized);
@@ -911,6 +943,15 @@ public final class ServerCore implements LineHandler, ControlOps {
         if (name == null) {
             name = "snap-" + server.getTickCount();
         }
+        // A remote write credential must not be able to point the snapshot at
+        // an arbitrary server file: only a single-segment name inside the
+        // snapshots root is accepted.
+        try {
+            name = ControlPaths.requireSafeSnapshotName(name);
+        } catch (IllegalArgumentException exception) {
+            reply.accept(errorJson("snapshot name rejected: " + exception.getMessage()).toString());
+            return;
+        }
 
         ServerLevel level = dimension == null
                 ? primaryLevel()
@@ -958,13 +999,21 @@ public final class ServerCore implements LineHandler, ControlOps {
         }
         entities = restorable;
 
-        Path snapshotDir = dir.resolve("snapshots").resolve(name);
+        Path snapshotDir;
+        try {
+            snapshotDir = ControlPaths.snapshotDirectory(dir, name);
+        } catch (java.io.IOException | IllegalArgumentException exception) {
+            reply.accept(errorJson("snapshot path rejected: " + exception.getMessage()).toString());
+            return;
+        }
         Path entitiesFile = snapshotDir.resolve("entities.jsonl");
         boolean replaced = Files.exists(entitiesFile);
         long bytes;
         int order = 0;
         try {
             Files.createDirectories(snapshotDir);
+            ControlPaths.requireInsideRoot(
+                    dir.toAbsolutePath().normalize().resolve("snapshots"), snapshotDir);
             try (BufferedWriter writer = Files.newBufferedWriter(entitiesFile, StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
                 for (Entity entity : entities) {

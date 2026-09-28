@@ -67,7 +67,11 @@ public final class ControlCommands {
     }
 
     private static boolean admin(CommandSourceStack source) {
-        return source.permissions().hasPermission(Permissions.COMMANDS_ADMIN);
+        // Credential management is owner-only: a remote write credential is
+        // capped at ADMIN level and can never reach this subtree, including
+        // through `/execute` or `/function` chains (they inherit the source
+        // permission set).
+        return source.permissions().hasPermission(Permissions.COMMANDS_OWNER);
     }
 
     private static int status(CommandSourceStack source) {

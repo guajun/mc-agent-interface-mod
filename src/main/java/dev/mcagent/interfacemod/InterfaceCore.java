@@ -349,14 +349,40 @@ public final class InterfaceCore implements LineHandler {
      * {@code mcagent.testClientCommands=true}; it exists so the #7 lifecycle
      * acceptance can be driven without a human at the keyboard.
      */
+    /**
+     * The normal world lifecycle ("Save and Quit to Title") without the
+     * blocking save screen.
+     *
+     * <p>{@code Minecraft.disconnectWithSavingScreen()} busy-waits on the
+     * render thread while calling {@code renderFrame} and does not complete
+     * when driven from a client tick (verified with the control transport
+     * disabled). The normal path is to stop the integrated server and let the
+     * client's own disconnect handling show the title screen; the world is
+     * saved by the server shutdown and can be reopened afterwards. Test-only:
+     * reachable while {@code mcagent.testClientCommands=true}.
+     */
     private void quitWorld() {
         Minecraft client = Minecraft.getInstance();
         if (client.level == null) {
             emit("world_close", "not in a world");
             return;
         }
-        emit("world_close", "saving and quitting to title");
-        client.disconnectWithSavingScreen();
+        IntegratedServer server = client.getSingleplayerServer();
+        if (server == null) {
+            emit("world_close", "no single-player server");
+            return;
+        }
+        emit("world_close", "stopping the integrated server");
+        Thread worker = new Thread(() -> {
+            try {
+                server.halt(false);
+                emit("world_close", "integrated server stopped");
+            } catch (Throwable throwable) {
+                emit("world_close_error", String.valueOf(throwable));
+            }
+        }, "mcagent-world-close");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     /**

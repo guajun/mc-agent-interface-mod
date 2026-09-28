@@ -61,6 +61,7 @@ public final class ControlServer {
     public static final String PROPERTY_MAX_PENDING = "mcagent.controlMaxPending";
     public static final String PROPERTY_REQUEST_TIMEOUT_MILLIS = "mcagent.controlRequestTimeoutMillis";
     public static final String PROPERTY_MAX_DROPPED = "mcagent.controlMaxDroppedEvents";
+    static final String BOOTSTRAP_FILE = "bootstrap-token.txt";
 
     public static final int CONTROL_PROTOCOL_VERSION = 1;
     public static final String TRANSPORT = "same-port-tls";
@@ -81,8 +82,8 @@ public final class ControlServer {
     private String tlsFingerprint;
     private volatile String tlsProblem;
     private final String instanceId;
-    private final String runId = "run_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
-    private final long runStartedAtMillis = System.currentTimeMillis();
+    private volatile String runId = "run_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+    private volatile long runStartedAtMillis = System.currentTimeMillis();
 
     private final Map<ChannelId, ControlSession> sessions = new ConcurrentHashMap<>();
     private final ArrayDeque<JsonObject> eventBuffer = new ArrayDeque<>();
@@ -90,6 +91,7 @@ public final class ControlServer {
     private final AtomicLong writeSequence = new AtomicLong();
     private final Map<String, WriteStatus> recentWrites = new LinkedHashMap<>();
     private final Map<String, FailureWindow> authFailures = new ConcurrentHashMap<>();
+    private final FailureWindow globalAuthFailures = new FailureWindow(System.currentTimeMillis());
     private final AtomicLong authFailuresTotal = new AtomicLong();
     private final AtomicLong droppedEventsTotal = new AtomicLong();
     private final AtomicLong requestsStarted = new AtomicLong();
@@ -198,6 +200,26 @@ public final class ControlServer {
         }
     }
 
+    /** Expire live sessions whose credential is gone; called once per tick. */
+    public static void expireSessionsNow() {
+        ControlServer server = instance;
+        if (server != null) {
+            server.expireSessions();
+        }
+    }
+
+    /**
+     * Called from the halt hook: close every session and start a new run so a
+     * reconnecting daemon is told the previous run ended instead of silently
+     * continuing from a stale event cursor.
+     */
+    public static void halted() {
+        ControlServer server = instance;
+        if (server != null) {
+            server.rotateRun();
+        }
+    }
+
     /** Diagnostics for STATE and for integration evidence. */
     public static JsonObject state() {
         ControlServer server = instance;
@@ -244,18 +266,36 @@ public final class ControlServer {
             ControlAuth.LoadReport report = auth.load();
             if (report.missing || report.loaded == 0) {
                 // First start with no credentials: issue one bootstrap credential
-                // and log it exactly once, like an install-time admin password.
+                // and write it to an owner-only file instead of broadcasting the
+                // bearer secret to every log collector.
+                Path secretFile = directory.resolve(BOOTSTRAP_FILE);
+                try {
+                    Files.deleteIfExists(secretFile);
+                } catch (IOException ignored) {
+                    // best effort: a stale file is overwritten below
+                }
                 String secret = auth.issue("bootstrap",
                         java.util.Set.of(ControlAuth.PERMISSION_READ, ControlAuth.PERMISSION_WRITE), null);
+                Files.writeString(secretFile, secret + System.lineSeparator(), StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                restrict(secretFile);
                 log("formal control: no usable credentials found; issued a bootstrap read+write credential");
-                log("formal control: BOOTSTRAP SECRET (shown once, store it now): " + secret);
-                log("formal control: revoke it after issuing per-daemon credentials (tokens live in "
-                        + auth.file().toAbsolutePath() + ")");
+                log("formal control: BOOTSTRAP CREDENTIAL is in " + secretFile.toAbsolutePath()
+                        + " (owner-only); move it to the daemon operator and delete the file");
             } else {
                 log("formal control: loaded " + report.loaded + " credential(s) from " + auth.file());
             }
         } catch (IOException exception) {
             log("formal control: cannot read credentials: " + exception);
+        }
+    }
+
+    private static void restrict(Path path) {
+        try {
+            Files.setPosixFilePermissions(path,
+                    java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        } catch (UnsupportedOperationException | IOException ignored) {
+            // Windows and exotic filesystems use the user profile ACL.
         }
     }
 
@@ -309,6 +349,17 @@ public final class ControlServer {
 
     void sessionOpened(ControlSession session) {
         sessions.put(session.channel().id(), session);
+    }
+
+    /** End the current run: new identity, empty stream, no live sessions. */
+    void rotateRun() {
+        synchronized (eventBuffer) {
+            runId = "run_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+            runStartedAtMillis = System.currentTimeMillis();
+            eventSequence.set(0);
+            eventBuffer.clear();
+        }
+        closeSessions("server halted; new run");
     }
 
     void sessionClosed(ControlSession session, String reason) {
@@ -391,12 +442,50 @@ public final class ControlServer {
 
     // ------------------------------------------------------------------ auth
 
+    /** True when the token is present, unrevoked, unexpired and has the permission. */
+    boolean tokenValid(String tokenId, String permission) {
+        ControlAuth.Entry entry = auth.entry(tokenId);
+        if (entry == null || entry.revoked) {
+            return false;
+        }
+        if (entry.expiresAtMillis != null && System.currentTimeMillis() > entry.expiresAtMillis) {
+            return false;
+        }
+        return entry.has(permission);
+    }
+
+    /** Close sessions whose credential expired, was revoked or lost permissions. */
+    void expireSessions() {
+        for (ControlSession session : new ArrayList<>(sessions.values())) {
+            String tokenId = session.tokenId();
+            if (tokenId == null) {
+                continue;
+            }
+            ControlAuth.Entry entry = auth.entry(tokenId);
+            if (entry == null || entry.revoked
+                    || (entry.expiresAtMillis != null && System.currentTimeMillis() > entry.expiresAtMillis)
+                    || entry.permissions.isEmpty()) {
+                session.close("credential expired, revoked or changed");
+            }
+        }
+    }
+
     boolean allowAuthAttempt(String remote) {
+        long now = System.currentTimeMillis();
+        long globalLimit = globalAuthFailureLimit();
+        synchronized (globalAuthFailures) {
+            if (now - globalAuthFailures.windowStartMillis > authFailureWindowMillis()) {
+                globalAuthFailures.count = 0;
+                globalAuthFailures.windowStartMillis = now;
+            }
+            if (globalAuthFailures.count >= globalLimit) {
+                return false;
+            }
+        }
         FailureWindow window = authFailures.get(remote);
         if (window == null) {
             return true;
         }
-        long now = System.currentTimeMillis();
         synchronized (window) {
             if (window.blockedUntilMillis > now) {
                 return false;
@@ -413,22 +502,35 @@ public final class ControlServer {
         authFailuresTotal.incrementAndGet();
         long now = System.currentTimeMillis();
         FailureWindow window = authFailures.computeIfAbsent(remote, key -> new FailureWindow(now));
+        int observed;
         synchronized (window) {
             if (now - window.windowStartMillis > authFailureWindowMillis()) {
                 window.count = 0;
                 window.windowStartMillis = now;
             }
             window.count++;
+            observed = window.count;
             if (window.count >= maxAuthFailuresPerWindow()) {
                 window.blockedUntilMillis = now + authFailureWindowMillis();
             }
         }
+        synchronized (globalAuthFailures) {
+            if (now - globalAuthFailures.windowStartMillis > authFailureWindowMillis()) {
+                globalAuthFailures.count = 0;
+                globalAuthFailures.windowStartMillis = now;
+            }
+            globalAuthFailures.count++;
+        }
         log("control authentication rejected from " + remote + " (" + status + "), failure "
-                + window.count + " in this window");
+                + observed + " in this window");
         if (authFailures.size() > 1024) {
             authFailures.entrySet().removeIf(entry ->
                     now - entry.getValue().windowStartMillis > 10 * authFailureWindowMillis());
         }
+    }
+
+    long globalAuthFailureLimit() {
+        return 100;
     }
 
     private static final class FailureWindow {
@@ -536,23 +638,36 @@ public final class ControlServer {
 
     // ------------------------------------------------------------------ events
 
+    /**
+     * The single monitor that orders event sequence assignment, the replay
+     * ring and the hand-off from replay to live delivery. Replay in
+     * {@link ControlSession#handleHello} runs under the same monitor, so a
+     * live event can never overtake or leak past a replayed one.
+     */
+    Object eventLock() {
+        return eventBuffer;
+    }
+
     void publishEvent(JsonObject rawEvent) {
-        long seq = eventSequence.incrementAndGet();
         JsonObject envelope = new JsonObject();
-        envelope.addProperty("type", "event");
-        envelope.addProperty("seq", seq);
-        envelope.addProperty("runId", runId);
-        envelope.addProperty("streamId", runId);
-        envelope.addProperty("serverTimeMillis", System.currentTimeMillis());
-        envelope.add("event", rawEvent);
         synchronized (eventBuffer) {
+            long seq = eventSequence.incrementAndGet();
+            envelope.addProperty("type", "event");
+            envelope.addProperty("seq", seq);
+            envelope.addProperty("runId", runId);
+            envelope.addProperty("streamId", runId);
+            envelope.addProperty("serverTimeMillis", System.currentTimeMillis());
+            envelope.add("event", rawEvent);
             eventBuffer.addLast(envelope);
             while (eventBuffer.size() > eventBufferSize()) {
                 eventBuffer.removeFirst();
             }
-        }
-        for (ControlSession session : sessions.values()) {
-            session.sendEvent(envelope, false);
+            // Broadcast while holding the same lock that orders the sequence:
+            // delivery order therefore matches seq order, and a welcome that
+            // is replaying under this lock cannot interleave with a live push.
+            for (ControlSession session : sessions.values()) {
+                session.sendEvent(envelope, false);
+            }
         }
     }
 
@@ -560,11 +675,14 @@ public final class ControlServer {
     record Replay(List<JsonObject> events, long from, long to, boolean lost) {
     }
 
+    /** Callers that need replay and the live hand-off to be one atomic step
+     * synchronize on {@link #eventLock()} around this call. */
     Replay replaySince(long lastSeq) {
         List<JsonObject> events = new ArrayList<>();
         long oldest;
-        long newest = eventSequence.get();
+        long newest;
         synchronized (eventBuffer) {
+            newest = eventSequence.get();
             oldest = eventBuffer.isEmpty() ? newest + 1 : eventBuffer.peekFirst().get("seq").getAsLong();
             for (JsonObject envelope : eventBuffer) {
                 if (envelope.get("seq").getAsLong() > lastSeq) {
@@ -578,6 +696,81 @@ public final class ControlServer {
             from = oldest;
         }
         return new Replay(events, from, newest, lost);
+    }
+
+    /**
+     * Replay for a cursor that belongs to another run (or an unknown run):
+     * every event of this run is new to the client, so the stream is reported
+     * as a gap rather than silently continuing from a stale sequence.
+     */
+    Replay replaySince(long lastSeq, boolean forceLost) {
+        Replay replay = replaySince(lastSeq);
+        if (!forceLost) {
+            return replay;
+        }
+        long from = replay.events().isEmpty() ? 1
+                : replay.events().get(0).get("seq").getAsLong();
+        return new Replay(replay.events(), from, replay.to(), true);
+    }
+
+    /**
+     * A canonical hash of the parameters as written by the client. Used to
+     * refuse the same request id with a different payload instead of returning
+     * a stale result for something else.
+     */
+    static String payloadHash(String operation, JsonObject params) {
+        StringBuilder canonical = new StringBuilder(operation == null ? "" : operation);
+        appendCanonical(canonical, params);
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(canonical.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte value : digest) {
+                hex.append(String.format("%02x", value));
+            }
+            return hex.toString();
+        } catch (java.security.NoSuchAlgorithmException exception) {
+            return canonical.toString();
+        }
+    }
+
+    private static void appendCanonical(StringBuilder out, JsonElement element) {
+        if (element == null || element.isJsonNull()) {
+            out.append("null");
+            return;
+        }
+        if (element.isJsonObject()) {
+            java.util.TreeMap<String, JsonElement> sorted = new java.util.TreeMap<>();
+            for (java.util.Map.Entry<String, JsonElement> entry : element.getAsJsonObject().entrySet()) {
+                sorted.put(entry.getKey(), entry.getValue());
+            }
+            out.append('{');
+            boolean first = true;
+            for (java.util.Map.Entry<String, JsonElement> entry : sorted.entrySet()) {
+                if (!first) {
+                    out.append(',');
+                }
+                first = false;
+                out.append(entry.getKey()).append(':');
+                appendCanonical(out, entry.getValue());
+            }
+            out.append('}');
+            return;
+        }
+        if (element.isJsonArray()) {
+            out.append('[');
+            boolean first = true;
+            for (JsonElement child : element.getAsJsonArray()) {
+                if (!first) {
+                    out.append(',');
+                }
+                first = false;
+                appendCanonical(out, child);
+            }
+            out.append(']');
+            return;
+        }
+        out.append(element.toString());
     }
 
     // ------------------------------------------------------------- write audit
@@ -594,16 +787,18 @@ public final class ControlServer {
         public final String tokenId;
         public final String requestId;
         public final String operation;
+        public final String payloadHash;
         public final long beganAtMillis;
-        public volatile WriteState state;
+        public volatile WriteState state = WriteState.PENDING;
         public volatile JsonObject result;
         public volatile JsonObject error;
         public volatile long updatedAtMillis;
 
-        WriteStatus(String tokenId, String requestId, String operation, long now) {
+        WriteStatus(String tokenId, String requestId, String operation, String payloadHash, long now) {
             this.tokenId = tokenId;
             this.requestId = requestId;
             this.operation = operation;
+            this.payloadHash = payloadHash;
             this.beganAtMillis = now;
             this.updatedAtMillis = now;
         }
@@ -630,11 +825,62 @@ public final class ControlServer {
         }
     }
 
-    void writeBegan(String tokenId, String requestId, String operation) {
+    /** Outcome of one atomic write reservation. */
+    public enum ReservationKind {
+        RESERVED,
+        DUPLICATE,
+        IN_FLIGHT,
+        CONFLICT,
+        BUSY,
+        UNKNOWN_STATE
+    }
+
+    /** One reservation attempt under the recent-writes lock. */
+    public static final class Reservation {
+        public final ReservationKind kind;
+        public final WriteStatus status;
+
+        Reservation(ReservationKind kind, WriteStatus status) {
+            this.kind = kind;
+            this.status = status;
+        }
+    }
+
+    /**
+     * Atomically reserve a write id: the first caller claims PENDING, a repeat
+     * with the same payload is de-duplicated, a repeat with a different payload
+     * is a conflict, and a still-running id is never overwritten. PENDING
+     * records are never evicted; when the ledger has no room for another
+     * in-flight write the caller is told BUSY instead of dropping status.
+     */
+    Reservation reserveWrite(String tokenId, String requestId, String operation, String payloadHash) {
         synchronized (recentWrites) {
-            recentWrites.put(key(tokenId, requestId),
-                    new WriteStatus(tokenId, requestId, operation, System.currentTimeMillis()));
-            evictWrites();
+            WriteStatus existing = recentWrites.get(key(tokenId, requestId));
+            if (existing != null && System.currentTimeMillis() - existing.updatedAtMillis > 30 * 60_000L) {
+                recentWrites.remove(key(tokenId, requestId));
+                existing = null;
+            }
+            if (existing != null) {
+                String existingHash = existing.payloadHash;
+                if (existingHash != null && payloadHash != null && !existingHash.equals(payloadHash)) {
+                    return new Reservation(ReservationKind.CONFLICT, existing);
+                }
+                WriteState state = existing.state == null ? WriteState.PENDING : existing.state;
+                if (state == WriteState.PENDING) {
+                    return new Reservation(ReservationKind.IN_FLIGHT, existing);
+                }
+                if (state == WriteState.UNKNOWN) {
+                    return new Reservation(ReservationKind.UNKNOWN_STATE, existing);
+                }
+                return new Reservation(ReservationKind.DUPLICATE, existing);
+            }
+            if (!evictWrites()) {
+                return new Reservation(ReservationKind.BUSY, null);
+            }
+            WriteStatus created = new WriteStatus(tokenId, requestId, operation, payloadHash,
+                    System.currentTimeMillis());
+            recentWrites.put(key(tokenId, requestId), created);
+            return new Reservation(ReservationKind.RESERVED, created);
         }
     }
 
@@ -644,14 +890,13 @@ public final class ControlServer {
         synchronized (recentWrites) {
             WriteStatus status = recentWrites.get(key(tokenId, requestId));
             if (status == null) {
-                status = new WriteStatus(tokenId, requestId, operation, System.currentTimeMillis());
+                status = new WriteStatus(tokenId, requestId, operation, null, System.currentTimeMillis());
                 recentWrites.put(key(tokenId, requestId), status);
             }
             status.state = ok ? WriteState.OK : WriteState.FAIL;
             status.result = result;
             status.error = error;
             status.updatedAtMillis = System.currentTimeMillis();
-            evictWrites();
         }
         JsonObject writeEvent = new JsonObject();
         writeEvent.addProperty("type", "write");
@@ -682,19 +927,36 @@ public final class ControlServer {
     /** A write that timed out before the game thread saw it; a retry re-executes. */
     void writeAbandoned(String tokenId, String requestId) {
         synchronized (recentWrites) {
-            recentWrites.remove(key(tokenId, requestId));
+            WriteStatus status = recentWrites.get(key(tokenId, requestId));
+            if (status == null) {
+                return;
+            }
+            WriteState state = status.state == null ? WriteState.PENDING : status.state;
+            if (state == WriteState.PENDING) {
+                recentWrites.remove(key(tokenId, requestId));
+            }
         }
     }
 
-    private void evictWrites() {
-        if (recentWrites.size() <= 1024) {
-            return;
+    /** True when there is room after dropping the oldest terminal records. */
+    private boolean evictWrites() {
+        if (recentWrites.size() < 1024) {
+            return true;
         }
-        var iterator = recentWrites.entrySet().iterator();
-        while (iterator.hasNext() && recentWrites.size() > 1024) {
-            iterator.next();
-            iterator.remove();
+        java.util.List<WriteStatus> terminal = new java.util.ArrayList<>();
+        for (WriteStatus status : recentWrites.values()) {
+            if (status.state == WriteState.OK || status.state == WriteState.FAIL || status.state == WriteState.UNKNOWN) {
+                terminal.add(status);
+            }
         }
+        terminal.sort(java.util.Comparator.comparingLong(status -> status.updatedAtMillis));
+        for (WriteStatus status : terminal) {
+            if (recentWrites.size() < 1024) {
+                break;
+            }
+            recentWrites.remove(key(status.tokenId, status.requestId));
+        }
+        return recentWrites.size() < 1024;
     }
 
     private static String key(String tokenId, String requestId) {

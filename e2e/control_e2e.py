@@ -171,7 +171,7 @@ class GoClients:
 def target_add(gocli: GoClients, home: Path, name: str, address: str, pin: str, token: str,
                default: bool = False) -> None:
     arguments = ["target", "add", name, "--transport", "remote", "--address", address,
-                 "--pin", pin, "--token-stdin"]
+                 "--pin", pin, "--token-stdin", "--force"]
     if default:
         arguments.append("--default")
     gocli.ok(home, arguments, input_text=token + "\n")
@@ -411,13 +411,20 @@ def scenario_dedicated(args) -> int:
     check("the fingerprint is only exposed once the transport is armed", bool(enabled))
 
     def bootstrap_secret() -> str | None:
-        match = re.search(r"BOOTSTRAP SECRET \(shown once, store it now\): (\S+)",
-                          "\n".join(current_run_lines(console_log)))
-        return match.group(1) if match else None
+        # The bearer secret is written to an owner-only file, never to the log;
+        # the log only points at the file.
+        path = control_dir / "bootstrap-token.txt"
+        if path.is_file():
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        return None
 
     rw_secret = wait_for(bootstrap_secret, 30, description="bootstrap credential")
-    check("a one-time bootstrap credential is issued and logged once",
+    check("a one-time bootstrap credential is written to an owner-only file",
           rw_secret.startswith("mca1."), "secret shape")
+    check("the bootstrap secret never appears in the server log",
+          rw_secret not in "\n".join(current_run_lines(console_log)))
     check("the credential file does not contain the secret",
           rw_secret not in (control_dir / "tokens.json").read_text(encoding="utf-8"))
 
@@ -508,6 +515,36 @@ def scenario_dedicated(args) -> int:
     first_write = gocli.ok(home_a, ["command", "say from-a", "--target", "dedicated"])
     check("a write returns an ordered write sequence number",
           isinstance(first_write.get("writeSeq"), int), json.dumps(first_write))
+
+    # A remote write credential must not be able to mint credentials. The
+    # /mcagent control subtree is owner-only and the remote command source is
+    # capped at ADMIN, including through /execute and /function chains.
+    for attempt in ("mcagent control token add smuggled read",
+                    "execute run mcagent control token add smuggled2 read"):
+        remote = gocli.json(home_a, ["command", attempt, "--target", "dedicated"])
+        output = json.dumps(remote)
+        check(f"remote '{attempt}' is refused by the permission boundary",
+              "Unknown or incomplete command" in output or "Incorrect argument" in output
+              or "permission" in output.lower() or "not allowed" in output.lower(), output[:400])
+        listing_after = rcon(lab_module, lab, "mcagent control token list")
+        check("no credential was minted through the remote command",
+              "smuggled" not in listing_after
+              and "smuggled" not in (control_dir / "tokens.json").read_text(encoding="utf-8"),
+              listing_after[-400:])
+
+    # Snapshot names are single directory segments inside the snapshots root.
+    good_snapshot = gocli.ok(home_a, ["snapshot", "--name", "e2e-ok", "--target", "dedicated"])
+    check("a safe snapshot name is accepted",
+          (lab / "mc-agent-server" / "snapshots" / "e2e-ok" / "entities.jsonl").is_file(),
+          json.dumps(good_snapshot))
+    for bad_name in ("..\\escape", "C:\\escape", "../../escape", "/escape", "con"):
+        refused = gocli.json(home_a, ["snapshot", "--name", bad_name, "--target", "dedicated"])
+        check(f"snapshot name {bad_name!r} is refused",
+              "error" in refused, json.dumps(refused)[:300])
+    check("no snapshot escaped the snapshots root",
+          not (lab / "escape").exists()
+          and not (lab / "mc-agent-server" / "snapshots" / "escape").exists()
+          and not (lab / "mc-agent-server" / "escape").exists())
 
     # Concurrent requests must not cross replies: two commands from A and a
     # read from B, all in flight at the same time.
@@ -758,12 +795,12 @@ def scenario_lan(args) -> int:
     pinned = wait_for(fingerprint, 120, description="LAN control fingerprint")
 
     def secret() -> str | None:
-        try:
-            text = (game_dir / "client.log").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-        match = re.search(r"BOOTSTRAP SECRET \(shown once, store it now\): (\S+)", text)
-        return match.group(1) if match else None
+        path = control_dir / "bootstrap-token.txt"
+        if path.is_file():
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        return None
 
     token = wait_for(secret, 60, description="LAN bootstrap credential")
     check("the LAN host exposes a pinned identity and one credential",
@@ -786,18 +823,30 @@ def scenario_lan(args) -> int:
     check("server-vantage commands work over the LAN control session",
           isinstance(command.get("writeSeq"), int), json.dumps(command))
 
-    # Normal in-game "Close LAN": the listener stops, which must close the
-    # control connection in the same process and world.
-    closed = client_request(game_dir, "LAN_CLOSE", wait=10.0)
-    check("the test-only LAN_CLOSE command is accepted",
-          closed.get("type") == "lan_close_ack", json.dumps(closed))
-    disconnected = wait_disconnected(gocli, home, "lan", timeout=120)
-    check("closing the LAN listener drops the control connection",
+    # Normal world close: Save and Quit to Title stops the integrated server,
+    # which stops the LAN listener and closes the control connection. The world
+    # is then reopened in the same client process and re-published on a new
+    # actual port.
+    closed = client_request(game_dir, "WORLD_CLOSE", wait=10.0)
+    check("the test-only WORLD_CLOSE command is accepted",
+          closed.get("type") == "world_close_ack", json.dumps(closed))
+    disconnected = wait_disconnected(gocli, home, "lan", timeout=180)
+    check("closing the world drops the control connection",
           disconnected.get("connected") is False, json.dumps(disconnected))
 
-    # Publish the same world again on a new real port.
+    # The client's own disconnect handling finishes the teardown; WORLD is then
+    # accepted again (a GenericMessageScreen during the transition is fine).
+    def world_reopened() -> bool:
+        try:
+            reply = client_request(game_dir, f"WORLD {args.world_name}", wait=10.0)
+        except TimeoutError:
+            return False
+        return reply.get("type") == "world_ack"
+
+    wait_for(world_reopened, args.client_wait, interval=2.0, description="world reopened")
+    check("the same client process reopens the saved world", True)
     second_port = publish_lan(game_dir, args.lan_port + 1, args.client_wait)
-    check("the world republishes on a new actual port", second_port == args.lan_port + 1,
+    check("the reopened world republishes on a new actual port", second_port == args.lan_port + 1,
           f"actual={second_port}")
     gocli.ok(home, ["target", "add", "lan", "--transport", "remote",
                     "--address", f"127.0.0.1:{second_port}", "--pin", pinned, "--token-stdin",
@@ -807,9 +856,13 @@ def scenario_lan(args) -> int:
     check("the daemon reconnects to the reopened world on the new port",
           after.get("connected") is True and after.get("endpoint", "").endswith(str(second_port)),
           json.dumps(after))
-    check("the reopened LAN listener keeps the same world run",
-          after.get("runId") == lan_state.get("runId"),
+    check("the reopened world is a new integrated-server run",
+          after.get("runId") != lan_state.get("runId"),
           f"first={lan_state.get('runId')} second={after.get('runId')}")
+    reopened_state = gocli.ok(home, ["state", "--target", "lan"])
+    check("the reopened world still sees the host player",
+          args.client_username in [entry.get("name") for entry in reopened_state.get("playerList") or []],
+          json.dumps(reopened_state)[:300])
 
     summary = {
         "scenario": "lan",

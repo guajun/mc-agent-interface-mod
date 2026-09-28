@@ -1,5 +1,6 @@
 package dev.mcagent.interfacemod.control;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -8,9 +9,13 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
 
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
@@ -27,17 +32,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * deduplicated by that id so a reconnect can ask {@code request_status} instead
  * of replaying a non-idempotent operation.
  *
- * <p>Requests are answered off the game thread by {@link ControlOps}; a request
- * that times out before it started is safe to retry, one that timed out while
- * running reports {@code resultUnknown}.
+ * <p>Requests are answered off the game thread by {@link ControlOps}. The
+ * session owns the request state machine: an unstarted request can still be
+ * cancelled, a running request reports result-unknown on timeout, and its
+ * terminal outcome is recorded even if the socket is already gone.
  */
 public final class ControlSession extends ByteToMessageDecoder {
     private static final int LENGTH_BYTES = 4;
+
+    /** Operations that only reveal state and therefore need a read permission. */
+    private static final java.util.Set<String> READ_OPERATIONS = java.util.Set.of(
+            "state", "entities", "player", "context", "wait", "snapshot", "snapshots",
+            "exclusive_status");
 
     private final ControlServer server;
     private final Channel channel;
     private final String sessionId = "sess_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
     private final String remote;
+    private final String remoteIp;
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final long openedAtMillis = System.currentTimeMillis();
@@ -53,6 +65,14 @@ public final class ControlSession extends ByteToMessageDecoder {
         this.server = server;
         this.channel = channel;
         this.remote = String.valueOf(channel.remoteAddress());
+        this.remoteIp = addressOf(channel.remoteAddress());
+    }
+
+    private static String addressOf(java.net.SocketAddress address) {
+        if (address instanceof InetSocketAddress inet && inet.getAddress() != null) {
+            return inet.getAddress().getHostAddress();
+        }
+        return String.valueOf(address);
     }
 
     public String sessionId() {
@@ -159,20 +179,23 @@ public final class ControlSession extends ByteToMessageDecoder {
         }
         String token = frame.has("token") && frame.get("token").isJsonPrimitive()
                 ? frame.get("token").getAsString() : "";
-        if (!server.allowAuthAttempt(remote)) {
+        if (!server.allowAuthAttempt(remoteIp)) {
             fatal("rate_limited", "too many failed authentication attempts; retry later");
             return;
         }
         ControlAuth.Result result = server.auth.authenticate(token, System.currentTimeMillis());
         if (result.status != ControlAuth.Status.OK) {
-            server.recordAuthFailure(remote, result.status);
+            server.recordAuthFailure(remoteIp, result.status);
             // One generic answer: never disclose which part of the credential was wrong.
             fatal("unauthorized", "the access credential was rejected");
             return;
         }
         this.auth = result.auth;
-        this.lastSeenSeq = frame.has("lastSeq") && frame.get("lastSeq").isJsonPrimitive()
+        long requestedSeq = frame.has("lastSeq") && frame.get("lastSeq").isJsonPrimitive()
                 ? Math.max(0L, frame.get("lastSeq").getAsLong()) : 0L;
+        boolean runMatches = !frame.has("runId") || !frame.get("runId").isJsonPrimitive()
+                || frame.get("runId").getAsString().equals(server.runId());
+        this.lastSeenSeq = runMatches ? requestedSeq : 0L;
         server.sessionOpened(this);
 
         JsonObject hello = new JsonObject();
@@ -189,28 +212,42 @@ public final class ControlSession extends ByteToMessageDecoder {
         hello.addProperty("serverTimeMillis", System.currentTimeMillis());
         hello.add("permissions", server.permissions(auth));
         hello.add("capabilities", server.capabilityTokens());
-        ControlServer.Replay replay = server.replaySince(lastSeenSeq);
-        JsonObject replayJson = new JsonObject();
-        replayJson.addProperty("requestedSince", lastSeenSeq);
-        replayJson.addProperty("from", replay.from());
-        replayJson.addProperty("to", replay.to());
-        replayJson.addProperty("lost", replay.lost());
-        replayJson.addProperty("bufferedEvents", replay.events().size());
-        replayJson.addProperty("persistedAcrossRuns", false);
-        hello.add("replay", replayJson);
         hello.add("limits", server.limitsJson());
         if (frame.has("client")) {
             hello.add("client", frame.get("client"));
         }
-        sendFrame(hello);
+
+        // Replay and the live hand-off are one atomic step under the event
+        // lock: an event published while the welcome is being written is
+        // either included in the replay or delivered live, never lost and
+        // never reordered.
         long replayed = 0;
-        for (JsonObject event : replay.events()) {
-            JsonObject envelope = event.deepCopy();
-            envelope.addProperty("replay", true);
-            sendFrame(envelope);
-            replayed++;
+        ControlServer.Replay replay;
+        synchronized (server.eventLock()) {
+            replay = !runMatches
+                    ? server.replaySince(0, true)
+                    : server.replaySince(lastSeenSeq, false);
+            JsonObject replayJson = new JsonObject();
+            replayJson.addProperty("requestedSince", lastSeenSeq);
+            replayJson.addProperty("from", replay.from());
+            replayJson.addProperty("to", replay.to());
+            replayJson.addProperty("lost", replay.lost());
+            replayJson.addProperty("bufferedEvents", replay.events().size());
+            replayJson.addProperty("persistedAcrossRuns", false);
+            replayJson.addProperty("crossRun", !runMatches);
+            hello.add("replay", replayJson);
+            if (sendFrame(hello) && server.tokenValid(auth.tokenId, ControlAuth.PERMISSION_READ)) {
+                for (JsonObject event : replay.events()) {
+                    JsonObject envelope = event.deepCopy();
+                    envelope.addProperty("replay", true);
+                    if (!sendFrame(envelope)) {
+                        break;
+                    }
+                    replayed++;
+                }
+            }
+            this.welcomed = true;
         }
-        this.welcomed = true;
         if (helloDeadline != null) {
             helloDeadline.cancel(false);
             helloDeadline = null;
@@ -242,33 +279,60 @@ public final class ControlSession extends ByteToMessageDecoder {
                     "operation " + operation + " is not available on this server vantage", false, false, null));
             return;
         }
-        if (write && !current.canWrite()) {
-            sendFrame(replyError(id, "forbidden", "this credential has no write permission", false, false, null));
+        if (!authorizedNow(operation, current)) {
+            sendFrame(replyError(id, "forbidden",
+                    permissionErrorMessage(operation, current), false, false, null));
             return;
         }
         if (write) {
-            ControlServer.WriteStatus prior = server.writeStatus(current.tokenId, id);
-            if (prior != null && prior.state == ControlServer.WriteState.OK) {
-                JsonObject result = prior.result == null ? new JsonObject() : prior.result.deepCopy();
-                result.addProperty("duplicate", true);
-                result.addProperty("requestId", id);
-                sendFrame(okFrame(id, result));
-                return;
-            }
-            if (prior != null && prior.state == ControlServer.WriteState.FAIL) {
-                JsonObject priorError = prior.error == null ? new JsonObject() : prior.error.deepCopy();
-                priorError.addProperty("duplicate", true);
-                sendFrame(errorFrame(id, priorError));
-                return;
-            }
-            if (prior != null && prior.state == ControlServer.WriteState.PENDING) {
-                sendFrame(replyError(id, "request_in_flight",
-                        "request " + id + " is still running; use request_status", true, false, null));
-                return;
+            String payloadHash = ControlServer.payloadHash(operation, params);
+            ControlServer.Reservation reservation = server.reserveWrite(current.tokenId, id, operation, payloadHash);
+            switch (reservation.kind) {
+                case CONFLICT -> {
+                    sendFrame(replyError(id, "conflict",
+                            "request id " + id + " was used before with a different payload", false, false, null));
+                    return;
+                }
+                case IN_FLIGHT -> {
+                    sendFrame(replyError(id, "request_in_flight",
+                            "request " + id + " is still running; use request_status", true, false, null));
+                    return;
+                }
+                case UNKNOWN_STATE -> {
+                    sendFrame(replyError(id, "result_unknown",
+                            "request " + id + " has an unknown outcome; query request_status", false, true, null));
+                    return;
+                }
+                case BUSY -> {
+                    sendFrame(replyError(id, "server_busy",
+                            "the write ledger is full of in-flight requests; retry shortly", true, false, null));
+                    return;
+                }
+                case DUPLICATE -> {
+                    ControlServer.WriteStatus prior = reservation.status;
+                    if (prior.state == ControlServer.WriteState.OK) {
+                        JsonObject result = prior.result == null ? new JsonObject() : prior.result.deepCopy();
+                        result.addProperty("duplicate", true);
+                        result.addProperty("requestId", id);
+                        sendFrame(okFrame(id, result));
+                    } else {
+                        JsonObject priorError = prior.error == null ? new JsonObject() : prior.error.deepCopy();
+                        priorError.addProperty("duplicate", true);
+                        sendFrame(errorFrame(id, priorError));
+                    }
+                    return;
+                }
+                case RESERVED -> {
+                    // fall through to dispatch below
+                }
+                default -> throw new IllegalStateException("unknown reservation " + reservation.kind);
             }
         }
 
         if (pending.size() >= server.maxPendingRequests()) {
+            if (write) {
+                server.writeAbandoned(current.tokenId, id);
+            }
             sendFrame(replyError(id, "too_many_pending",
                     "this session already has " + pending.size() + " pending requests", true, false, null));
             return;
@@ -279,17 +343,10 @@ public final class ControlSession extends ByteToMessageDecoder {
         }
         Pending request = new Pending(id, operation, params, write, timeoutMillis);
         pending.put(id, request);
-        if (write) {
-            server.writeBegan(current.tokenId, id, operation);
-        }
         request.timeout = channel.eventLoop().schedule(request::onTimeout, timeoutMillis, TimeUnit.MILLISECONDS);
         server.sessionRequestBegan(this);
         if ("ping".equals(operation)) {
-            JsonObject pong = new JsonObject();
-            pong.addProperty("pong", true);
-            pong.addProperty("runId", server.runId());
-            pong.addProperty("sessionId", sessionId);
-            request.ok(pong);
+            request.ok(pongJson());
             return;
         }
         if ("capabilities".equals(operation)) {
@@ -309,6 +366,36 @@ public final class ControlSession extends ByteToMessageDecoder {
         } catch (RuntimeException exception) {
             request.fail("internal", "operation failed to start: " + exception, true, false);
         }
+    }
+
+    /** True when the live credential still authorizes this operation. */
+    private boolean authorizedNow(String operation, ControlAuth.Auth current) {
+        ControlAuth.Entry entry = server.auth.entry(current.tokenId);
+        if (entry == null || entry.revoked) {
+            return false;
+        }
+        if (entry.expiresAtMillis != null && System.currentTimeMillis() > entry.expiresAtMillis) {
+            return false;
+        }
+        boolean write = ControlOps.WRITE_OPERATIONS.contains(operation)
+                || (operation.startsWith("exclusive_") && !"exclusive_status".equals(operation));
+        if (write) {
+            return entry.has(ControlAuth.PERMISSION_WRITE);
+        }
+        if ("request_status".equals(operation)) {
+            return entry.has(ControlAuth.PERMISSION_READ) || entry.has(ControlAuth.PERMISSION_WRITE);
+        }
+        if (READ_OPERATIONS.contains(operation)) {
+            return entry.has(ControlAuth.PERMISSION_READ);
+        }
+        return entry.has(ControlAuth.PERMISSION_READ) || entry.has(ControlAuth.PERMISSION_WRITE);
+    }
+
+    private static String permissionErrorMessage(String operation, ControlAuth.Auth current) {
+        if (READ_OPERATIONS.contains(operation)) {
+            return "this credential has no read permission";
+        }
+        return "this credential has no permission for " + operation;
     }
 
     private void handleRequestStatus(Pending request) {
@@ -334,7 +421,7 @@ public final class ControlSession extends ByteToMessageDecoder {
         long now = System.currentTimeMillis();
         switch (request.operation) {
             case "exclusive_acquire" -> {
-                if (!auth.canWrite()) {
+                if (!server.tokenValid(auth.tokenId, ControlAuth.PERMISSION_WRITE)) {
                     request.fail("forbidden", "exclusive operations need write permission", false, false);
                     return;
                 }
@@ -359,7 +446,7 @@ public final class ControlSession extends ByteToMessageDecoder {
                 }
             }
             case "exclusive_renew" -> {
-                if (!auth.canWrite()) {
+                if (!server.tokenValid(auth.tokenId, ControlAuth.PERMISSION_WRITE)) {
                     request.fail("forbidden", "exclusive operations need write permission", false, false);
                     return;
                 }
@@ -386,7 +473,7 @@ public final class ControlSession extends ByteToMessageDecoder {
                 }
             }
             case "exclusive_release" -> {
-                if (!auth.canWrite()) {
+                if (!server.tokenValid(auth.tokenId, ControlAuth.PERMISSION_WRITE)) {
                     request.fail("forbidden", "exclusive operations need write permission", false, false);
                     return;
                 }
@@ -436,27 +523,31 @@ public final class ControlSession extends ByteToMessageDecoder {
         }
     }
 
-    /** Push one live event envelope (already sequenced by {@link ControlServer}). */
-    void sendEvent(JsonObject envelope, boolean replay) {
+    /**
+     * Push one live event envelope (already sequenced by {@link ControlServer}).
+     * A session whose reader cannot keep up is closed instead of silently
+     * dropping events: the client then reconnects and the server's replay
+     * report makes the gap machine-readable.
+     */
+    boolean sendEvent(JsonObject envelope, boolean replay) {
         if (closed.get() || !welcomed) {
-            return;
+            return false;
+        }
+        ControlAuth.Auth current = auth;
+        if (current == null || !server.tokenValid(current.tokenId, ControlAuth.PERMISSION_READ)) {
+            // Events are read data; a write-only or revoked credential must
+            // not receive them.
+            return false;
         }
         if (!channel.isWritable()) {
-            droppedEvents++;
-            if (droppedEvents == 1 || droppedEvents % 256 == 0) {
-                ControlServer.log("control session " + sessionId + " is not writable; dropped "
-                        + droppedEvents + " events (replay buffer still holds them)");
-            }
-            if (droppedEvents > server.maxDroppedEvents()) {
-                close("slow consumer: dropped " + droppedEvents + " events");
-            }
-            return;
+            close("slow consumer: outbound buffer full");
+            return false;
         }
         JsonObject copy = envelope.deepCopy();
         if (replay) {
             copy.addProperty("replay", true);
         }
-        sendFrame(copy);
+        return sendFrame(copy);
     }
 
     /** Send a fatal protocol error and close after the write flushes. */
@@ -472,31 +563,18 @@ public final class ControlSession extends ByteToMessageDecoder {
         channel.writeAndFlush(frameBuffer(frame)).addListener(future -> close("protocol error"));
     }
 
-    private JsonObject replyError(String id, String code, String message, boolean retryable,
-                                  boolean resultUnknown, JsonObject details) {
-        JsonObject error = new JsonObject();
-        error.addProperty("code", code);
-        error.addProperty("message", message);
-        error.addProperty("retryable", retryable);
-        error.addProperty("resultUnknown", resultUnknown);
-        if (details != null) {
-            error.add("details", details);
-        }
-        return errorFrame(id, error);
-    }
-
-    private JsonObject pongJson() {
-        JsonObject pong = new JsonObject();
-        pong.addProperty("pong", true);
-        pong.addProperty("runId", server.runId());
-        pong.addProperty("sessionId", sessionId);
-        pong.addProperty("serverTimeMillis", System.currentTimeMillis());
-        return pong;
-    }
-
-    private void sendFrame(JsonObject frame) {
+    /**
+     * Queue one frame. Returns false and closes the session when the outbound
+     * buffer is above its water mark: replies have no queue of their own, so a
+     * reader that cannot drain them must not let them pile up without bound.
+     */
+    private boolean sendFrame(JsonObject frame) {
         if (closed.get()) {
-            return;
+            return false;
+        }
+        if (!channel.isWritable()) {
+            close("slow consumer: outbound buffer full");
+            return false;
         }
         ByteBuf buffer = frameBuffer(frame);
         if (channel.eventLoop().inEventLoop()) {
@@ -504,6 +582,7 @@ public final class ControlSession extends ByteToMessageDecoder {
         } else {
             channel.eventLoop().execute(() -> channel.writeAndFlush(buffer));
         }
+        return true;
     }
 
     private ByteBuf frameBuffer(JsonObject frame) {
@@ -575,6 +654,28 @@ public final class ControlSession extends ByteToMessageDecoder {
         return frame;
     }
 
+    private JsonObject replyError(String id, String code, String message, boolean retryable,
+                                  boolean resultUnknown, JsonObject details) {
+        JsonObject error = new JsonObject();
+        error.addProperty("code", code);
+        error.addProperty("message", message);
+        error.addProperty("retryable", retryable);
+        error.addProperty("resultUnknown", resultUnknown);
+        if (details != null) {
+            error.add("details", details);
+        }
+        return errorFrame(id, error);
+    }
+
+    private JsonObject pongJson() {
+        JsonObject pong = new JsonObject();
+        pong.addProperty("pong", true);
+        pong.addProperty("runId", server.runId());
+        pong.addProperty("sessionId", sessionId);
+        pong.addProperty("serverTimeMillis", System.currentTimeMillis());
+        return pong;
+    }
+
     private static String frameId(JsonObject frame) {
         return frame.has("id") && frame.get("id").isJsonPrimitive()
                 ? frame.get("id").getAsString() : "";
@@ -606,9 +707,10 @@ public final class ControlSession extends ByteToMessageDecoder {
         private final boolean write;
         private final long timeoutMillis;
         private final AtomicBoolean finished = new AtomicBoolean();
+        private final AtomicBoolean cancelled = new AtomicBoolean();
         private volatile boolean started;
         private volatile boolean timedOut;
-        private ScheduledFuture<?> timeout;
+        private volatile ScheduledFuture<?> timeout;
 
         Pending(String id, String operation, JsonObject params, boolean write, long timeoutMillis) {
             this.id = id;
@@ -618,18 +720,32 @@ public final class ControlSession extends ByteToMessageDecoder {
             this.timeoutMillis = timeoutMillis;
         }
 
+        /**
+         * Claim the operation on the game thread. Returns false when the
+         * request was cancelled (timeout before start or session close), so the
+         * queued game task is skipped instead of running after a "safe retry"
+         * was already promised.
+         */
         @Override
-        public void started() {
+        public boolean started() {
+            if (cancelled.get() || finished.get()) {
+                return false;
+            }
             started = true;
+            if (!authorizedNow(operation, auth)) {
+                fail("unauthorized", "the credential was revoked or no longer permits " + operation,
+                        false, false);
+                return false;
+            }
+            return true;
         }
 
         @Override
         public void ok(JsonElement result) {
-            if (!finished.compareAndSet(false, true)) {
+            if (!finishToken()) {
                 return;
             }
             cancelTimeout();
-            gone();
             JsonElement payload = result == null ? new JsonObject() : result;
             if (write) {
                 JsonObject object = payload.isJsonObject() ? payload.getAsJsonObject().deepCopy() : new JsonObject();
@@ -640,9 +756,10 @@ public final class ControlSession extends ByteToMessageDecoder {
                 object.addProperty("writeSeq", writeSeq);
                 payload = object;
             }
-            if (!timedOut) {
+            if (!timedOut && !closed.get()) {
                 sendFrame(okFrame(id, payload));
             }
+            gone();
         }
 
         @Override
@@ -653,11 +770,10 @@ public final class ControlSession extends ByteToMessageDecoder {
         @Override
         public void fail(String code, String message, boolean retryable, boolean resultUnknown,
                          JsonObject details) {
-            if (!finished.compareAndSet(false, true)) {
+            if (!finishToken()) {
                 return;
             }
             cancelTimeout();
-            gone();
             JsonObject error = new JsonObject();
             error.addProperty("code", code);
             error.addProperty("message", message);
@@ -669,9 +785,10 @@ public final class ControlSession extends ByteToMessageDecoder {
             if (write) {
                 server.writeCompleted(auth.tokenId, id, operation, false, null, error);
             }
-            if (!timedOut) {
+            if (!timedOut && !closed.get()) {
                 sendFrame(errorFrame(id, error));
             }
+            gone();
         }
 
         /** The client gave up waiting. Keep the operation; report what we know. */
@@ -680,30 +797,63 @@ public final class ControlSession extends ByteToMessageDecoder {
                 return;
             }
             timedOut = true;
-            gone();
+            if (!started) {
+                // The game thread has not claimed it: cancel so the queued
+                // task is skipped, and drop the ledger entry so a retry with
+                // this id can execute.
+                cancelled.set(true);
+                finishToken();
+                if (write) {
+                    server.writeAbandoned(auth.tokenId, id);
+                }
+                gone();
+                JsonObject error = new JsonObject();
+                error.addProperty("code", "timeout");
+                error.addProperty("retryable", true);
+                error.addProperty("resultUnknown", false);
+                error.addProperty("message", "operation " + operation + " did not start in "
+                        + timeoutMillis + "ms; it is safe to retry");
+                if (!closed.get()) {
+                    sendFrame(errorFrame(id, error));
+                }
+                return;
+            }
+            // Already running: the ledger keeps the pending record until the
+            // game thread reports the terminal outcome, which stays queryable
+            // through request_status.
             JsonObject error = new JsonObject();
             error.addProperty("code", "timeout");
-            error.addProperty("retryable", !started);
-            error.addProperty("resultUnknown", started);
-            error.addProperty("message", started
-                    ? "operation " + operation + " is still running; its result is unknown, query request_status"
-                    : "operation " + operation + " did not start in " + timeoutMillis + "ms; it is safe to retry");
-            if (write && !started) {
-                server.writeAbandoned(auth.tokenId, id);
+            error.addProperty("retryable", false);
+            error.addProperty("resultUnknown", true);
+            error.addProperty("message", "operation " + operation
+                    + " is still running; its result is unknown, query request_status");
+            if (!closed.get()) {
+                sendFrame(errorFrame(id, error));
             }
-            sendFrame(errorFrame(id, error));
         }
 
+        /**
+         * The socket is gone. Delivery stops, but a request that already
+         * started keeps running and its terminal outcome is still recorded in
+         * the ledger; an unstarted queued request is cancelled and retryable.
+         */
         private void onSessionClosed() {
             if (finished.get()) {
                 return;
             }
-            finished.set(true);
+            if (!started) {
+                cancelled.set(true);
+                finishToken();
+                if (write) {
+                    server.writeAbandoned(auth.tokenId, id);
+                }
+                gone();
+            }
             cancelTimeout();
-            gone();
-            // A write that was already handed to the game thread keeps running and
-            // its result is stored for request_status; a queued one can still run
-            // too, because it is already scheduled. Neither is reported as failed.
+        }
+
+        private boolean finishToken() {
+            return finished.compareAndSet(false, true);
         }
 
         private void gone() {
@@ -712,8 +862,9 @@ public final class ControlSession extends ByteToMessageDecoder {
         }
 
         private void cancelTimeout() {
-            if (timeout != null) {
-                timeout.cancel(false);
+            ScheduledFuture<?> current = timeout;
+            if (current != null) {
+                current.cancel(false);
             }
         }
     }
