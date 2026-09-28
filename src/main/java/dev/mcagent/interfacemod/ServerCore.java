@@ -1,5 +1,7 @@
 package dev.mcagent.interfacemod;
 
+import dev.mcagent.interfacemod.control.ControlOps;
+import dev.mcagent.interfacemod.control.ControlServer;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
@@ -64,7 +66,7 @@ import java.util.stream.Stream;
  * inside the process can read it, so only this vantage can fork a live world
  * faithfully.
  */
-public final class ServerCore implements LineHandler {
+public final class ServerCore implements LineHandler, ControlOps {
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
     private static final String[] PLAYER_OPERATIONS =
             {"PLAYER", "PLAYER_GET", "PLAYER_CONTEXT", "PLAYER_STATE"};
@@ -102,6 +104,9 @@ public final class ServerCore implements LineHandler {
         if (SamePortControl.enabled()) {
             sink.addListener(SamePortControl::broadcast);
         }
+        if (ControlServer.enabled()) {
+            sink.addListener(ControlServer::onEventLine);
+        }
         if (!socket.start()) {
             emitError("bind", "no free server port");
             return;
@@ -129,6 +134,159 @@ public final class ServerCore implements LineHandler {
                 wait.reply.accept(ack("wait", "ticks=0").toString());
             }
         }
+    }
+
+    // ------------------------------------------------------------------ control
+
+    /**
+     * The formal control protocol's game-facing half (issue #8). Every call is
+     * scheduled on the server thread; {@code started()} marks the moment the
+     * operation really begins so a client-side timeout can distinguish "never
+     * ran" from "result unknown".
+     */
+    @Override
+    public void execute(String operation, JsonObject params, ControlOps.Reply reply) {
+        JsonObject safe = params == null ? new JsonObject() : params;
+        try {
+            server.execute(() -> {
+                reply.started();
+                try {
+                    runControlOperation(operation, safe, reply);
+                } catch (Throwable throwable) {
+                    reply.fail("game_error", "operation failed: " + throwable, false, false);
+                }
+            });
+        } catch (Throwable throwable) {
+            reply.fail("server_unavailable", "the server is not accepting work: " + throwable, true, false);
+        }
+    }
+
+    private void runControlOperation(String operation, JsonObject params, ControlOps.Reply reply) {
+        switch (operation) {
+            case "state" -> reply.ok(stateJson());
+            case "entities" -> {
+                double radius = doubleParam(params, "radius", 0.0D);
+                if (radius < 0.0D) {
+                    reply.fail("bad_request", "radius cannot be negative", false, false);
+                    return;
+                }
+                reply.ok(entitiesJson(radius));
+            }
+            case "player" -> {
+                String query = firstNonEmpty(params, "player", "uuid", "name", "id");
+                if (query.isEmpty()) {
+                    reply.fail("bad_request", "player needs a name or uuid", false, false);
+                    return;
+                }
+                reply.ok(playerJson(query));
+            }
+            case "context" -> {
+                String id = firstNonEmpty(params, "contextId", "context_id", "id", "context");
+                if (id.isEmpty()) {
+                    reply.fail("bad_request", "context needs an id", false, false);
+                    return;
+                }
+                reply.ok(contextJson(id));
+            }
+            case "command" -> {
+                String command = stringParam(params, "command");
+                if (command.isEmpty()) {
+                    reply.fail("bad_request", "command must not be empty", false, false);
+                    return;
+                }
+                runCommand(oneLine(command), lineReply(reply));
+            }
+            case "mark" -> {
+                String text = oneLine(stringParam(params, "text"));
+                emit("mark", text);
+                reply.ok(ack("mark", text));
+            }
+            case "wait" -> {
+                long ticks = longParam(params, "ticks", 1L);
+                if (ticks <= 0 || ticks > 72_000L) {
+                    reply.fail("bad_request", "ticks must be 1..72000", false, false);
+                    return;
+                }
+                waits.add(new Wait((int) ticks, lineReply(reply)));
+            }
+            case "snapshot" -> snapshot(doubleParam(params, "radius", 0.0D),
+                    stringParam(params, "name"), stringParam(params, "dimension"), lineReply(reply));
+            case "snapshots" -> reply.ok(listSnapshots());
+            default -> reply.fail("capability_not_supported",
+                    "operation " + operation + " is not available on the server vantage", false, false);
+        }
+    }
+
+    /** Wrap the legacy JSON-string reply into the structured control reply. */
+    private Consumer<String> lineReply(ControlOps.Reply reply) {
+        return answer -> {
+            JsonObject parsed;
+            try {
+                parsed = JsonParser.parseString(answer).getAsJsonObject();
+            } catch (RuntimeException exception) {
+                reply.fail("internal", "unreadable answer from the game: " + exception, false, false);
+                return;
+            }
+            if ("error".equals(parsed.get("type").getAsString())) {
+                reply.fail("game_error", parsed.has("message") ? parsed.get("message").getAsString()
+                        : "the game reported an error", false, false);
+                return;
+            }
+            reply.ok(parsed);
+        };
+    }
+
+    private static String stringParam(JsonObject params, String name) {
+        if (params.has(name) && params.get(name).isJsonPrimitive()) {
+            return params.get(name).getAsString().trim();
+        }
+        return "";
+    }
+
+    private static String firstNonEmpty(JsonObject params, String... names) {
+        for (String name : names) {
+            String value = stringParam(params, name);
+            if (!value.isEmpty()) {
+                return value;
+            }
+        }
+        return "";
+    }
+
+    private static double doubleParam(JsonObject params, String name, double fallback) {
+        if (params.has(name) && params.get(name).isJsonPrimitive()) {
+            try {
+                return params.get(name).getAsDouble();
+            } catch (NumberFormatException | UnsupportedOperationException ignored) {
+                return fallback;
+            }
+        }
+        return fallback;
+    }
+
+    private static long longParam(JsonObject params, String name, long fallback) {
+        if (params.has(name) && params.get(name).isJsonPrimitive()) {
+            try {
+                return params.get(name).getAsLong();
+            } catch (NumberFormatException | UnsupportedOperationException ignored) {
+                return fallback;
+            }
+        }
+        return fallback;
+    }
+
+    private static String oneLine(String value) {
+        return value == null ? "" : value.replace('\n', ' ').replace('\r', ' ');
+    }
+
+    @Override
+    public JsonArray capabilities() {
+        return JsonParser.parseString(InterfaceConstants.SERVER_CAPABILITIES).getAsJsonArray();
+    }
+
+    @Override
+    public String instanceKind() {
+        return "server";
     }
 
     // ------------------------------------------------------------------ protocol
@@ -246,6 +404,8 @@ public final class ServerCore implements LineHandler {
         // Issue #7 evidence: what the experimental same-port control transport
         // sees. Disabled builds report enabled=false and no sessions.
         object.add("samePortSpike", SamePortControl.state());
+        // Issue #8: the formal TLS/credential control transport.
+        object.add("control", ControlServer.state());
         return object;
     }
 
@@ -736,6 +896,17 @@ public final class ServerCore implements LineHandler {
         }
         if (index < parts.length) {
             dimension = parts[index];
+        }
+        snapshot(radius, name, dimension, reply);
+    }
+
+    private void snapshot(Double radiusValue, String nameValue, String dimensionValue, Consumer<String> reply) {
+        double radius = radiusValue == null ? 0.0D : radiusValue;
+        String name = nameValue == null || nameValue.isBlank() ? null : nameValue.trim();
+        String dimension = dimensionValue == null || dimensionValue.isBlank() ? null : dimensionValue.trim();
+        if (radius < 0.0D) {
+            reply.accept(errorJson("radius cannot be negative").toString());
+            return;
         }
         if (name == null) {
             name = "snap-" + server.getTickCount();

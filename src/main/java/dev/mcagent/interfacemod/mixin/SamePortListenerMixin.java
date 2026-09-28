@@ -1,6 +1,7 @@
 package dev.mcagent.interfacemod.mixin;
 
 import dev.mcagent.interfacemod.SamePortControl;
+import dev.mcagent.interfacemod.control.ControlServer;
 import net.minecraft.server.network.ServerConnectionListener;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -32,11 +33,13 @@ public abstract class SamePortListenerMixin {
     private void mcagent$closeSamePortSessions(CallbackInfo callback) {
         SamePortControl.closeAll("game port listener stopped");
         SamePortControl.clearListener();
+        ControlServer.closeAll("game port listener stopped");
     }
 
     @Inject(method = "stop", at = @At("TAIL"))
     private void mcagent$closeSamePortSessionsOnStop(CallbackInfo callback) {
         SamePortControl.closeAll("server listener stopped");
         SamePortControl.clearListener();
+        ControlServer.closeAll("server listener stopped");
     }
 }

@@ -51,6 +51,7 @@ public final class InterfaceModTests {
         unsignedReceiptKeySurvivesFiltering();
         samePortMarkerIsDistinctFromVanillaHandshakes();
         samePortSnifferFramesShortAndFragmentedTraffic();
+        new dev.mcagent.interfacemod.control.ControlProtocolTests().run();
         System.out.println("all " + checks + " checks passed");
     }
 
