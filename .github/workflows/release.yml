@@ -21,14 +21,52 @@ permissions:
   contents: read
 
 jobs:
+  resolve:
+    name: resolve the source commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: resolve the release tag
+        id: resolve
+        shell: bash
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          [ -n "$TAG" ] || { echo "no release tag was provided" >&2; exit 1; }
+          git fetch --force --tags origin
+          git fetch origin main
+          git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1 || { echo "tag $TAG does not exist" >&2; exit 1; }
+          SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          git merge-base --is-ancestor "$SHA" origin/main || {
+            echo "tag $TAG ($SHA) is not reachable from origin/main" >&2
+            exit 1
+          }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
   build:
     name: build and verify the mod jar
+    needs: resolve
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -36,6 +74,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: verify checkout provenance
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          [ "$HEAD_SHA" = "$EXPECTED_SHA" ] || { echo "checkout $HEAD_SHA != resolved $EXPECTED_SHA" >&2; exit 1; }
       - name: resolve version and tag
         id: version
         shell: bash
@@ -97,21 +143,43 @@ jobs:
 
   publish:
     name: publish GitHub release
-    needs: build
+    needs: [resolve, build]
     if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: mod-release-assets
           path: dist
+      - name: verify source provenance
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          [ "$HEAD_SHA" = "$EXPECTED_SHA" ] || { echo "checkout $HEAD_SHA != resolved $EXPECTED_SHA" >&2; exit 1; }
+          python - "$VERSION" <<'PY'
+          import json, sys, zipfile
+          version = sys.argv[1]
+          with zipfile.ZipFile(f"dist/mc-agent-interface-{version}.jar") as archive:
+              metadata = json.loads(archive.read("fabric.mod.json"))
+          if metadata["version"] != version:
+              raise SystemExit(f"jar version {metadata['version']} != {version}")
+          print(f"provenance ok: mod {version}")
+          PY
       - name: create the release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          TAG: ${{ needs.resolve.outputs.tag }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           cat > "$RUNNER_TEMP/notes.md" <<EOF
@@ -135,6 +203,7 @@ jobs:
           Toolkit documentation at https://guajun.github.io/mc-agent/.
           EOF
           gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             --verify-tag \
