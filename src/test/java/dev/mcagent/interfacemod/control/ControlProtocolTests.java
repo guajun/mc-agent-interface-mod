@@ -280,6 +280,30 @@ public final class ControlProtocolTests {
                 check(client.isClosed(5000), "bad credential connection is closed");
             }
 
+            // Wrong protocol version: a named fatal error, then close.
+            try (FrameClient client = new FrameClient(factory, port)) {
+                JsonObject future = hello(writeToken, 0);
+                future.addProperty("protocol", 99);
+                client.send(future);
+                JsonObject error = client.readNext(5000);
+                check(error.get("type").getAsString().equals("error"), "wrong version gets a fatal error");
+                check(error.get("code").getAsString().equals("protocol_version"),
+                        "wrong version names the protocol_version error");
+                check(client.isClosed(5000), "wrong version connection is closed");
+            }
+
+            // Malformed input: a non-JSON frame is a fatal bad_frame.
+            try (FrameClient client = new FrameClient(factory, port)) {
+                client.send(hello(writeToken, 0));
+                client.readNext(5000);
+                client.sendRaw("this is not json");
+                JsonObject error = client.readNext(5000);
+                check(error.get("type").getAsString().equals("error"), "malformed frame gets a fatal error");
+                check(error.get("code").getAsString().equals("bad_frame"),
+                        "malformed frame names the bad_frame error");
+                check(client.isClosed(5000), "malformed frame connection is closed");
+            }
+
             try (FrameClient client = new FrameClient(factory, port)) {
                 client.send(hello(writeToken, 0));
                 JsonObject welcome = client.readNext(5000);
@@ -511,6 +535,13 @@ public final class ControlProtocolTests {
 
         void sendDeclaredLength(int length) throws IOException {
             out.writeInt(length);
+            out.flush();
+        }
+
+        void sendRaw(String text) throws IOException {
+            byte[] payload = text.getBytes(StandardCharsets.UTF_8);
+            out.writeInt(payload.length);
+            out.write(payload);
             out.flush();
         }
 
