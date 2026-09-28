@@ -53,12 +53,18 @@ func main() {
 	transport := flag.String("transport", "same-port-spike", "expected hello transport")
 	disconnectOK := flag.Bool("disconnect-ok", false,
 		"treat a mid-hold disconnect as a recorded event instead of a failure (world-close test)")
+	eventWait := flag.Duration("event-wait", 2*time.Second,
+		"how long to wait for a pushed event after MARK before closing")
 	flag.Parse()
 
 	result := map[string]any{
 		"name": *name,
 		"addr": *addr,
 	}
+	// Pushed event lines are skipped by request() but recorded, so the driver
+	// can verify that the same-port session really receives EventSink events
+	// (the hello advertises events:chat/events:game).
+	events := []string{}
 	fail := func(err error) {
 		result["ok"] = false
 		result["error"] = err.Error()
@@ -82,7 +88,7 @@ func main() {
 		fail(fmt.Errorf("write marker: %w", err))
 	}
 
-	hello, rawHello, err := request(conn, reader, "", *timeout)
+	hello, rawHello, err := request(conn, reader, "", *timeout, &events)
 	if err != nil {
 		fail(fmt.Errorf("read hello: %w", err))
 	}
@@ -99,7 +105,7 @@ func main() {
 	result["hello_port"] = intField(hello, "port")
 
 	// PING
-	pong, rawPong, err := request(conn, reader, "PING", *timeout)
+	pong, rawPong, err := request(conn, reader, "PING", *timeout, &events)
 	if err != nil {
 		fail(fmt.Errorf("PING: %w", err))
 	}
@@ -109,7 +115,7 @@ func main() {
 	result["ping"] = true
 
 	pollState := func() (map[string]any, string, error) {
-		state, rawState, err := request(conn, reader, "STATE", *timeout)
+		state, rawState, err := request(conn, reader, "STATE", *timeout, &events)
 		if err != nil {
 			return nil, rawState, err
 		}
@@ -131,10 +137,39 @@ func main() {
 	emitEvent(event{Event: "state", Name: *name, Local: local, Players: intPtr(players),
 		Control: intPtr(sessions), Tick: int64Ptr(int64Field(state, "tick"))})
 
+	// The EventSink broadcasts from its own writer thread, so an event can
+	// arrive shortly after the reply to the request that caused it. MARK and
+	// then wait for the pushed line, which also makes the capability claim in
+	// the hello observable.
+	if _, _, err := request(conn, reader, "MARK control-probe-"+*name+" ready", *timeout, &events); err != nil {
+		fail(fmt.Errorf("MARK ready: %w", err))
+	}
+	drainEvents(conn, reader, *eventWait, &events)
+
 	polls := []map[string]any{}
 	maxSessions := sessions
 	minPlayers := players
 	maxPlayers := players
+
+	// A mid-hold disconnect is only a recorded observation for a genuine peer
+	// termination; timeouts and protocol errors stay failures. The statistics
+	// gathered before the disconnect are kept either way.
+	recordDisconnect := func(err error) {
+		result["disconnected"] = true
+		result["disconnect_error"] = err.Error()
+		result["ok"] = true
+		result["poll_count"] = len(polls)
+		if len(polls) > 0 {
+			result["polls"] = polls
+		}
+		result["players_min"] = minPlayers
+		result["players_max"] = maxPlayers
+		result["control_sessions_max"] = maxSessions
+		result["events_seen"] = events
+		emitEvent(event{Event: "disconnect", Name: *name, Local: local, Note: err.Error()})
+		emit("RESULT " + mustJSON(result))
+	}
+
 	deadline := time.Now().Add(*hold)
 	for time.Now().Before(deadline) {
 		if *poll > 0 {
@@ -142,12 +177,8 @@ func main() {
 		}
 		state, rawState, err := pollState()
 		if err != nil {
-			if *disconnectOK {
-				result["disconnected"] = true
-				result["disconnect_error"] = err.Error()
-				result["ok"] = true
-				emitEvent(event{Event: "disconnect", Name: *name, Local: local, Note: err.Error()})
-				emit("RESULT " + mustJSON(result))
+			if *disconnectOK && isDisconnect(err) {
+				recordDisconnect(err)
 				return
 			}
 			fail(fmt.Errorf("STATE during hold: %w", err))
@@ -177,20 +208,18 @@ func main() {
 	result["players_min"] = minPlayers
 	result["players_max"] = maxPlayers
 	result["control_sessions_max"] = maxSessions
+	result["events_seen"] = events
 
 	// Final marker, then half-close and require the server to close its side.
-	if _, _, err := request(conn, reader, "MARK control-probe-"+*name+" closing", *timeout); err != nil {
-		if *disconnectOK {
-			result["disconnected"] = true
-			result["disconnect_error"] = err.Error()
-			result["ok"] = true
-			emitEvent(event{Event: "disconnect", Name: *name, Local: local, Note: err.Error()})
-			emit("RESULT " + mustJSON(result))
+	if _, _, err := request(conn, reader, "MARK control-probe-"+*name+" closing", *timeout, &events); err != nil {
+		if *disconnectOK && isDisconnect(err) {
+			recordDisconnect(err)
 			return
 		}
 		fail(fmt.Errorf("MARK: %w", err))
 	}
 	result["mark"] = true
+	result["events_seen"] = events
 
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		if err := tcp.CloseWrite(); err != nil {
@@ -201,14 +230,29 @@ func main() {
 			fail(fmt.Errorf("close: %w", err))
 		}
 	}
+
+	// After the half close the peer may still flush event lines before its
+	// FIN; drain until EOF and tolerate them. EOF is the only clean close.
 	conn.SetReadDeadline(time.Now().Add(*timeout))
-	_, readErr := reader.ReadByte()
-	serverClosed := errors.Is(readErr, io.EOF)
-	result["server_closed"] = serverClosed
-	if !serverClosed {
-		if readErr == nil {
-			fail(errors.New("server kept sending after close"))
+	serverClosed := false
+	var readErr error
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			readErr = err
+			serverClosed = errors.Is(err, io.EOF)
+			break
 		}
+		var message map[string]any
+		if json.Unmarshal([]byte(line), &message) == nil {
+			if pushed, _ := message["event"].(bool); pushed {
+				events = append(events, stringField(message, "type"))
+			}
+		}
+	}
+	result["server_closed"] = serverClosed
+	result["events_seen"] = events
+	if !serverClosed {
 		fail(fmt.Errorf("server did not close its side: %w", readErr))
 	}
 
@@ -216,9 +260,33 @@ func main() {
 	emit("RESULT " + mustJSON(result))
 }
 
+// drainEvents reads for window and records pushed event types; a read deadline
+// simply ends the wait and leaves the reader usable for later requests.
+func drainEvents(conn net.Conn, reader *bufio.Reader, window time.Duration, events *[]string) {
+	if window <= 0 {
+		return
+	}
+	conn.SetReadDeadline(time.Now().Add(window))
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		var message map[string]any
+		if json.Unmarshal([]byte(line), &message) != nil {
+			continue
+		}
+		if pushed, ok := message["event"].(bool); ok && pushed && events != nil {
+			*events = append(*events, stringField(message, "type"))
+		}
+	}
+}
+
 // request writes one request line (unless it is the empty marker read) and
-// returns the next reply object, skipping pushed event lines.
-func request(conn net.Conn, reader *bufio.Reader, line string, timeout time.Duration) (map[string]any, string, error) {
+// returns the next reply object, skipping pushed event lines. Event type names
+// are appended to events when it is not nil.
+func request(conn net.Conn, reader *bufio.Reader, line string, timeout time.Duration,
+	events *[]string) (map[string]any, string, error) {
 	if line != "" {
 		conn.SetWriteDeadline(time.Now().Add(timeout))
 		if _, err := conn.Write([]byte(line + "\n")); err != nil {
@@ -236,6 +304,9 @@ func request(conn net.Conn, reader *bufio.Reader, line string, timeout time.Dura
 			return nil, raw, fmt.Errorf("reply is not JSON: %q", raw)
 		}
 		if pushed, ok := message["event"].(bool); ok && pushed {
+			if events != nil {
+				*events = append(*events, stringField(message, "type"))
+			}
 			continue
 		}
 		return message, raw, nil

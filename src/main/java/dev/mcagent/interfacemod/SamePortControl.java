@@ -133,6 +133,17 @@ public final class SamePortControl {
         pipeline.addFirst(HANDLER_NAME, new Sniffer(connection));
     }
 
+    /**
+     * Push one event line to every open same-port session, exactly like
+     * {@code InterfaceServer.broadcast} does for the loopback vantage, so the
+     * capabilities advertised by the same-port hello stay true.
+     */
+    public static void broadcast(String line) {
+        for (Session session : SESSIONS.values()) {
+            session.send(line);
+        }
+    }
+
     /** Close every live control session; used when the listener or server stops. */
     public static void closeAll(String reason) {
         for (Session session : new ArrayList<>(SESSIONS.values())) {
@@ -168,16 +179,6 @@ public final class SamePortControl {
         }
         for (int index = 0; index < magic.length; index++) {
             if (candidate[index] != magic[index]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean matchesMagic(ByteBuf in) {
-        String magic = InterfaceConstants.SAME_PORT_MAGIC;
-        for (int index = 0; index < magic.length(); index++) {
-            if (in.getByte(in.readerIndex() + index) != (byte) magic.charAt(index)) {
                 return false;
             }
         }
@@ -261,18 +262,31 @@ public final class SamePortControl {
         @Override
         protected void decode(ChannelHandlerContext context, ByteBuf in, List<Object> out) {
             if (!sniffed) {
-                if (in.readableBytes() < InterfaceConstants.SAME_PORT_MAGIC.length()) {
+                // Decide on the first byte that cannot be the marker. A short
+                // vanilla handshake is often shorter than the marker length
+                // (a one-character virtual host is 10 bytes for handshake +
+                // status request), so waiting for the full marker would stall
+                // it until the handshake deadline. Only a strict prefix of the
+                // marker is allowed to wait for more bytes.
+                String magic = InterfaceConstants.SAME_PORT_MAGIC;
+                int available = in.readableBytes();
+                int compared = Math.min(available, magic.length());
+                for (int index = 0; index < compared; index++) {
+                    if (in.getByte(in.readerIndex() + index) != (byte) magic.charAt(index)) {
+                        sniffed = true;
+                        cancelDeadline();
+                        // Not a control connection: remove ourselves and let
+                        // every buffered vanilla byte flow downstream.
+                        context.pipeline().remove(this);
+                        return;
+                    }
+                }
+                if (available < magic.length()) {
                     return;
                 }
                 sniffed = true;
                 cancelDeadline();
-                if (!matchesMagic(in)) {
-                    // Not a control connection: remove ourselves and let the
-                    // buffered vanilla handshake bytes flow downstream.
-                    context.pipeline().remove(this);
-                    return;
-                }
-                in.skipBytes(InterfaceConstants.SAME_PORT_MAGIC.length());
+                in.skipBytes(magic.length());
                 adopt(context);
             }
             if (session != null) {

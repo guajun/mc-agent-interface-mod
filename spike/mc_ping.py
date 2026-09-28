@@ -64,11 +64,17 @@ def read_packet(sock: socket.socket) -> bytes:
 
 
 def status(host: str = "127.0.0.1", port: int = 25565, protocol: int = 0,
-           timeout: float = 5.0) -> dict:
-    """Return the server-list status JSON, like the client's multiplayer list."""
+           timeout: float = 5.0, handshake_host: str | None = None) -> dict:
+    """Return the server-list status JSON, like the client's multiplayer list.
+
+    ``handshake_host`` overrides the name inside the handshake packet, which
+    lets the test use a one-character virtual host: that makes the whole
+    handshake plus status request only 10 bytes, shorter than the same-port
+    marker, and is the regression for the sniffer's framing.
+    """
     with socket.create_connection((host, port), timeout=timeout) as sock:
         reader = sock.recv
-        host_bytes = host.encode("utf-8")
+        host_bytes = (handshake_host or host).encode("utf-8")
         body = (
             write_varint(0)  # handshake packet id
             + write_varint(protocol)
@@ -127,10 +133,13 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=25565)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--json", action="store_true", help="print the whole status JSON")
+    parser.add_argument("--handshake-host", default=None,
+                        help="virtual host name inside the handshake (defaults to --host)")
     args = parser.parse_args()
 
     try:
-        payload = status(args.host, args.port, timeout=args.timeout)
+        payload = status(args.host, args.port, timeout=args.timeout,
+                         handshake_host=args.handshake_host)
         pong = ping(args.host, args.port, timeout=args.timeout)
     except OSError as error:
         print(f"status ping failed: {error}", file=sys.stderr)

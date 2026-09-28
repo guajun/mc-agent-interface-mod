@@ -14,9 +14,13 @@ Two scenarios, both opt-in and isolated:
 
 ``lan``
     Launch a real client in an isolated game directory with the mod, open a
-    copied throwaway world, publish it to the LAN on an explicit port, run
-    probes against that actual port, close the world, then reopen it on a
-    different port and connect again.
+    copied throwaway world, publish it to the LAN on an explicit port, and run
+    probes against that actual port. The close step terminates the host client
+    process (an abrupt world shutdown, not the in-game Close LAN action), then
+    restarts it and publishes on a different port to connect again. The world
+    name must be one safe save-folder segment and an existing target is refused
+    unless ``--force-world`` is passed: the driver never deletes a save it did
+    not copy.
 
 Every check is reported honestly: a scenario that cannot run (no Java, no
 client, no network) fails with the reason instead of claiming success.
@@ -37,6 +41,7 @@ Example (Windows, from the meta checkout that holds the sibling repos)::
 from __future__ import annotations
 
 import argparse
+import atexit
 import importlib.util
 import json
 import os
@@ -54,6 +59,53 @@ HERE = Path(__file__).resolve().parent
 PASSED: list[str] = []
 FAILED: list[str] = []
 EVIDENCE: list[dict] = []
+
+class Cleanup:
+    """Terminate everything this run started, even when a check raises.
+
+    The driver owns lab servers and Minecraft clients; a failed scenario must
+    not leave a world or a control listener running. atexit handles the
+    SystemExit paths (the driver never hard-kills itself).
+    """
+
+    INSTANCES: list["Cleanup"] = []
+
+    def __init__(self, lab_module, lab_name: str) -> None:
+        self.lab_module = lab_module
+        self.lab_name = lab_name
+        self.lab_running = False
+        self.processes: list[subprocess.Popen] = []
+        Cleanup.INSTANCES.append(self)
+
+    def track(self, process: subprocess.Popen) -> subprocess.Popen:
+        self.processes.append(process)
+        return process
+
+    def stop_lab(self) -> None:
+        if not self.lab_running:
+            return
+        self.lab_running = False
+        try:
+            self.lab_module.cmd_stop(SimpleNamespace(name=self.lab_name, timeout=60.0, force=False))
+        except SystemExit:
+            pass
+
+    def close(self) -> None:
+        for process in self.processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except OSError:
+                pass
+        self.stop_lab()
+
+
+def _cleanup_everything() -> None:
+    for guard in list(Cleanup.INSTANCES):
+        guard.close()
+
+
+atexit.register(_cleanup_everything)
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
@@ -75,6 +127,18 @@ def import_file(name: str, path: Path):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+WORLD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_world_name(name: str) -> str:
+    """Reject anything that is not one safe save-folder segment."""
+    if not WORLD_NAME_RE.match(name):
+        raise SystemExit(
+            f"refusing world name {name!r}: use 1-64 characters of [A-Za-z0-9._-], "
+            "with no path separators or leading dot")
+    return name
 
 
 def load_lab_server(path: Path, lab_root: Path):
@@ -243,6 +307,7 @@ def scenario_dedicated(args) -> int:
         name=args.lab_name, mc="", fabric_api=True, carpet=False, mod_jar=[str(mod_jar)],
         mod_url=[], world="", void=True, java=args.jdk25, memory="", loader="", force=False))
     lab, state = lab_module.load_lab(args.lab_name)
+    guard = Cleanup(lab_module, args.lab_name)
     game_port = int(state["serverPort"])
     rcon_port = int(state["rconPort"])
     console_log = lab / "logs" / "console.log"
@@ -253,6 +318,7 @@ def scenario_dedicated(args) -> int:
     os.environ.update(env)
     try:
         lab_module.cmd_start(SimpleNamespace(name=args.lab_name, java=args.jdk25, memory="", wait=300))
+        guard.lab_running = True
     finally:
         os.environ.clear()
         os.environ.update(previous_env)
@@ -272,6 +338,17 @@ def scenario_dedicated(args) -> int:
               version.get("protocol") == 776 and version.get("name") == "26.2",
               json.dumps(version))
         check("vanilla status ping round-trip", pong == 0x0102030405060708, f"pong={pong!r}")
+    # Regression for review item 1: a handshake that advertises a one-character
+    # virtual host is only 10 bytes, shorter than the 18-byte marker, and must
+    # pass the sniffer at once instead of waiting for the handshake deadline.
+    try:
+        short_status = mc_ping.status("127.0.0.1", game_port, timeout=10.0, handshake_host="a")
+    except OSError as error:
+        check("short-host vanilla status handshake passes the sniffer", False, str(error))
+    else:
+        short_version = short_status.get("version", {})
+        check("short-host vanilla status handshake passes the sniffer",
+              short_version.get("protocol") == 776, json.dumps(short_version))
     run_log = "\n".join(current_run_lines(console_log))
     check("server announced Done", "Done (" in run_log, "no Done line in this run")
     check("spike enabled in the server log",
@@ -282,9 +359,10 @@ def scenario_dedicated(args) -> int:
 
     print("== two independent Go control probes")
     hold = args.probe_hold
-    probe_a = run_probe(probe, f"127.0.0.1:{game_port}", "A", hold, evidence / "probe-A.log")
+    probe_a = guard.track(run_probe(probe, f"127.0.0.1:{game_port}", "A", hold, evidence / "probe-A.log"))
     time.sleep(args.stagger)
-    probe_b = run_probe(probe, f"127.0.0.1:{game_port}", "B", hold - args.stagger, evidence / "probe-B.log")
+    probe_b = guard.track(run_probe(probe, f"127.0.0.1:{game_port}", "B", hold - args.stagger,
+                                    evidence / "probe-B.log"))
 
     client = None
     player_joined_at = None
@@ -293,7 +371,7 @@ def scenario_dedicated(args) -> int:
         mods = ensure_client_mods(client_dir, lab / "mods")
         print(f"== launch real client ({args.client_username}) with mods {mods}")
         client_log = client_dir / "client.log"
-        client = launch_client(args, client_dir, client_log, args.client_username)
+        client = guard.track(launch_client(args, client_dir, client_log, args.client_username))
         reply = client_request(client_dir, f"CONNECT 127.0.0.1:{game_port}", wait=args.client_wait)
         check("client mod accepted CONNECT", reply.get("type") == "connect_ack", json.dumps(reply))
         joined = wait_log(console_log, f"{args.client_username} joined the game", args.client_wait)
@@ -315,7 +393,7 @@ def scenario_dedicated(args) -> int:
             check("RCON list after the real player left is empty", "0 of a max" in after, after)
 
             print("== reconnect the real client to prove the player path survives")
-            client2 = launch_client(args, client_dir, client_log, args.client_username)
+            client2 = guard.track(launch_client(args, client_dir, client_log, args.client_username))
             reply2 = client_request(client_dir, f"CONNECT 127.0.0.1:{game_port}", wait=args.client_wait)
             check("client mod accepted the reconnect", reply2.get("type") == "connect_ack", json.dumps(reply2))
             rejoined = wait_log_count(console_log, f"{args.client_username} joined the game", 2,
@@ -370,9 +448,38 @@ def scenario_dedicated(args) -> int:
     check("spike transport is observable in STATE",
           '"samePortSpike"' in initial_state and '"transport":"same-port-spike"' in initial_state,
           initial_state[:200])
+    events_a = result_a.get("events_seen", [])
+    hello_a = result_a.get("hello", "")
+    check("hello advertises event streams and the session really receives one",
+          "events:game" in hello_a and "mark" in events_a,
+          f"hello_events={'events:game' in hello_a} seen={events_a}")
 
     after_all = rcon(lab_module, lab, "list")
     check("RCON list after all probes shows no players", "0 of a max" in after_all, after_all)
+
+    # The LAN scenario cannot drive an in-game world close yet, but the mixin's
+    # listener-stop path is the same for a dedicated stop and a LAN unpublish,
+    # so verify that graceful stop closes a live same-port session.
+    stop_result = None
+    if not args.keep:
+        print("== graceful server stop closes a live control session")
+        stop_log = evidence / "probe-stop.log"
+        stop_probe = guard.track(run_probe(probe, f"127.0.0.1:{game_port}", "STOP", 60, stop_log,
+                                           disconnect_ok=True))
+        saw_state = wait_probe_event(stop_log, "state", timeout=30.0)
+        check("stop probe completed hello/ping/STATE", saw_state, "no state event within 30s")
+        if saw_state:
+            lab_module.cmd_stop(SimpleNamespace(name=args.lab_name, timeout=120.0, force=False))
+            guard.lab_running = False
+            try:
+                stop_probe.wait(timeout=90)
+            except subprocess.TimeoutExpired:
+                stop_probe.terminate()
+            stop_result = probe_result(stop_log)
+            check("graceful server stop closes the same-port control session",
+                  stop_result.get("disconnected") is True or stop_result.get("server_closed") is True,
+                  json.dumps({k: stop_result.get(k) for k in ("ok", "disconnected", "server_closed",
+                                                              "disconnect_error")}))
 
     summary = {
         "scenario": "dedicated",
@@ -383,6 +490,7 @@ def scenario_dedicated(args) -> int:
         "probe": str(probe),
         "probe_a": result_a,
         "probe_b": result_b,
+        "probe_stop": stop_result,
         "player": args.client_username if args.client else None,
         "checks": EVIDENCE,
         "passed": PASSED,
@@ -391,9 +499,7 @@ def scenario_dedicated(args) -> int:
     }
     (evidence / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
-    if not args.keep:
-        print("== stop lab")
-        lab_module.cmd_stop(SimpleNamespace(name=args.lab_name, timeout=120.0, force=False))
+    guard.stop_lab()
 
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed; evidence in {evidence}")
     return 1 if FAILED else 0
@@ -402,15 +508,34 @@ def scenario_dedicated(args) -> int:
 # --------------------------------------------------------------------------- lan
 
 
-def prepare_lan_world(lab: Path, game_dir: Path, world_name: str) -> Path:
+def prepare_lan_world(lab: Path, game_dir: Path, world_name: str, force: bool = False) -> Path:
+    """Copy the lab's throwaway world into the isolated game dir.
+
+    Never deletes a save it did not copy: the name is one safe path segment,
+    the target must sit directly under game-dir/saves, and an existing target
+    is refused unless --force-world was passed explicitly. A failed copy
+    removes only the partial target it just created.
+    """
+    validate_world_name(world_name)
     source = lab / "world"
-    if not (source / "level.dat").exists():
+    if not (source / "level.dat").is_file():
         raise SystemExit(f"no generated world at {source}; provision/start the lab once first")
-    target = game_dir / "saves" / world_name
+    saves_root = (game_dir / "saves").resolve()
+    target = (saves_root / world_name).resolve()
+    if target.parent != saves_root:
+        raise SystemExit(f"refusing world target outside {saves_root}: {target}")
     if target.exists():
+        if not force:
+            raise SystemExit(
+                f"refusing to replace the existing {target}; move it away or pass "
+                "--force-world (the driver never deletes a save it did not copy)")
         shutil.rmtree(target)
-    shutil.copytree(source, target)
-    (target / "session.lock").unlink(missing_ok=True)
+    try:
+        shutil.copytree(source, target)
+        (target / "session.lock").unlink(missing_ok=True)
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
     return target
 
 
@@ -463,18 +588,20 @@ def scenario_lan(args) -> int:
         name=args.lab_name, mc="", fabric_api=True, carpet=False, mod_jar=[str(mod_jar)],
         mod_url=[], world="", void=True, java=args.jdk25, memory="", loader="", force=False))
     lab, state = lab_module.load_lab(args.lab_name)
+    guard = Cleanup(lab_module, args.lab_name)
     previous_env = os.environ.copy()
     os.environ["JAVA_TOOL_OPTIONS"] = "-Dmcagent.samePortSpike=true"
     try:
         lab_module.cmd_start(SimpleNamespace(name=args.lab_name, java=args.jdk25, memory="", wait=300))
+        guard.lab_running = True
     finally:
         os.environ.clear()
         os.environ.update(previous_env)
-    lab_module.cmd_stop(SimpleNamespace(name=args.lab_name, timeout=120.0, force=False))
+    guard.stop_lab()
 
     game_dir = args.game_dir.resolve()
     ensure_client_mods(game_dir, lab / "mods")
-    world = prepare_lan_world(lab, game_dir, args.world_name)
+    world = prepare_lan_world(lab, game_dir, args.world_name, force=args.force_world)
     print(f"== copied world to {world} (isolated game dir)")
 
     console_log = game_dir / "client.log"
@@ -482,20 +609,22 @@ def scenario_lan(args) -> int:
 
     def attempt(port: int, tag: str, hold: float, close_world: bool) -> dict:
         client, reply = open_world_and_lan(args, game_dir, console_log, args.world_name, port, args.client_username)
+        guard.track(client)
         detail = reply.get("detail", "")
         actual_port = int(detail.split("port=")[1].split()[0]) if "port=" in detail else port
         check(f"LAN {tag} published on the requested port {port}", actual_port == port, str(reply))
         log = evidence / f"probe-lan-{tag}.log"
-        running = run_probe(probe, f"127.0.0.1:{actual_port}", f"LAN-{tag}-A", hold, log, disconnect_ok=True)
+        running = guard.track(run_probe(probe, f"127.0.0.1:{actual_port}", f"LAN-{tag}-A", hold, log,
+                                        disconnect_ok=True))
         saw_state = wait_probe_event(log, "state", timeout=40.0)
         check(f"LAN {tag} probe completed hello/ping/STATE", saw_state, "no state event within 40s")
         time.sleep(3.0)
         if close_world:
-            print("== close the world (terminate the host client)")
+            print("== terminate the host client process (abrupt world shutdown)")
             client.terminate()
             running.wait(timeout=hold + 60)
             result = probe_result(log)
-            check("the world closing disconnected the control connection",
+            check("host process termination disconnected the control connection",
                   result.get("disconnected") is True,
                   json.dumps(result.get("disconnect_error")))
             closed = False
@@ -504,7 +633,8 @@ def scenario_lan(args) -> int:
                     closed = True
                     break
                 time.sleep(1.0)
-            check("first LAN port is no longer listening", closed, f"port {actual_port} still answers")
+            check("first LAN port is no longer listening after the host process died", closed,
+                  f"port {actual_port} still answers")
         else:
             running.wait(timeout=hold + 60)
             result = probe_result(log)
@@ -527,6 +657,7 @@ def scenario_lan(args) -> int:
         "second_port": second["port"],
         "first": first["result"],
         "second": second["result"],
+        "close_path": "host process termination (abrupt); in-game world close / same-process reopen not verified",
         "checks": EVIDENCE,
         "passed": PASSED,
         "failed": FAILED,
@@ -593,7 +724,9 @@ def main() -> int:
                      help="launcher game root with versions/ and libraries/")
     lan.add_argument("--version", default="26.2-Fabric")
     lan.add_argument("--game-dir", type=Path, required=True)
-    lan.add_argument("--world-name", default="issue7-lan")
+    lan.add_argument("--world-name", default="issue7-lan") 
+    lan.add_argument("--force-world", action="store_true",
+                     help="allow replacing an existing save under game-dir/saves (default: refuse)")
     lan.add_argument("--lan-port", type=int, default=25565)
     lan.add_argument("--lan-close-hold", type=float, default=20.0,
                      help="probe hold for the reopen attempt, where the probe closes itself")

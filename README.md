@@ -236,8 +236,11 @@ How it works:
   the placeholder `Connection` from the server's connection list, and speaks the
   existing JSON-lines protocol through the same server vantage - no player, no
   entity, no join;
-- when it is absent, the handler removes itself and the buffered bytes flow into
-  the untouched vanilla pipeline, so a normal player is unaffected.
+- when it is absent, the handler decides on the first byte that cannot be the
+  marker, removes itself, and replays every buffered byte into the untouched
+  vanilla pipeline, so even a short vanilla handshake is forwarded at once;
+- same-port sessions receive the same pushed events as the loopback vantage, so
+  the advertised `events:chat`/`events:game` capability is real.
 
 Enable it only in an isolated test environment:
 
@@ -251,10 +254,12 @@ also set. Authentication and the real wire protocol are issue #8; TLS and a
 formal version preamble are deliberately not decided here.
 
 The transport is verified on a dedicated server (two independent Go probes,
-plus a real client joining, quitting and reconnecting) and on a LAN-hosted
-integrated server (closing the world drops the connections; reopening it on a
-new port connects again). See `spike/README.md` for the design, the exact
-commands, the check-by-check results and the remaining gaps.
+plus a real client joining, quitting and reconnecting, and a graceful server
+stop) and on a LAN-hosted integrated server (terminating the host process
+releases the port; restarting the host and publishing on a new port connects
+again; an in-game world close is not driven by the harness). See
+`spike/README.md` for the design, the exact commands, the check-by-check
+results and the remaining gaps.
 
 ## Build
 

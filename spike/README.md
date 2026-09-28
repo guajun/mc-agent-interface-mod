@@ -77,16 +77,27 @@ a byte. Then:
   uses. The hello line adds `"transport":"same-port-spike"` and a session id;
   `STATE` adds a `samePortSpike` object with `enabled`, `allowRemote`,
   `sessions` and the open session list.
-- **Marker absent.** The sniffer removes itself and Netty forwards the already
-  buffered bytes into the untouched vanilla pipeline. A normal player is
-  byte-for-byte unaffected.
+- **Marker absent.** The sniffer decides on the **first byte that cannot be
+  the marker** and removes itself, so every buffered byte is replayed into the
+  untouched vanilla pipeline. A vanilla handshake shorter than the marker (a
+  one-character virtual host makes the handshake plus status request only 10
+  bytes) is forwarded at once instead of waiting for the handler deadline.
+  Only a strict prefix of `MCAGENT-CONTROL/1` is allowed to wait for more
+  bytes.
+
+The hello keeps the server-vantage capability list, and `EventSink` pushes are
+now broadcast to same-port sessions as well (the listener is added when the
+spike is enabled), so the advertised `events:chat`/`events:game` capability is
+real: the probes observe the `mark` event they cause.
 
 Lifecycle:
 
 - `SamePortListenerMixin` remembers the listener that owns the current TCP
   port (`startTcpServerListener`) and closes all control sessions when
-  `stopTcpServerListener`/`stop` run - i.e. when "Close LAN"/world close
-  tears the port down.
+  `stopTcpServerListener`/`stop` run - the same listener-stop path a LAN
+  unpublish uses. The dedicated scenario verifies that a graceful server stop
+  closes a live control session; the in-game "Close LAN" UI action itself is
+  not driven by the harness (see limitations).
 - `SamePortListenerAccessor` exposes `connections` for the detach step.
 
 Safety rails (this is an unauthenticated spike):
@@ -114,7 +125,7 @@ The spike compiles and runs against Minecraft 26.2 (unobfuscated) only:
 | `PacketFlow.SERVERBOUND`, `io.netty.channel.local.LocalChannel` | filter that keeps the sniffer off outbound and in-memory connections |
 | `net.minecraft.server.network.ServerConnectionListener` | `startTcpServerListener`, `stopTcpServerListener`, `stop`, `connections` |
 | handler names `timeout`, `splitter`, `decoder`, `prepender`, `encoder`, `outbound_config`, `hackfix`, `packet_handler` | removed at takeover; unknown future handlers are removed generically except Netty's hidden head/tail contexts |
-| `MCAGENT-CONTROL/1` + `\n` | provisional marker; a vanilla handshake cannot collide (packet id `0x43` is not a handshake packet) |
+| `MCAGENT-CONTROL/1` + `\n` | provisional marker; a vanilla handshake cannot collide (packet id `0x43` is not a handshake packet), and framing decides on the first mismatching byte |
 
 On a different Minecraft version the mixins may fail to apply, and because the
 mixin config is `required: true` that would be visible at startup rather than
@@ -133,29 +144,39 @@ committed in `spike/evidence/issue-7-evidence.json`.
 Environment: Minecraft 26.2, Fabric loader 0.19.5, Fabric API 0.161.0+26.2,
 Java 25.0.1 (Microsoft), Windows, mod jar
 `dist/mc-agent-interface-0.7.0.jar`
-(sha256 `c78a85ddb26bbbedd0a0627046af77d8796dbd2b67b37cab4ed0f395048edb54`),
-probe built with Go 1.26.4. A rebuild is source-identical but not
-byte-identical (`build.py` does not normalise ZIP entry timestamps), so the
-hash identifies the artifact of the recorded run.
+(sha256 `0135d9bf88935e3e454dbda5f37b5d588575a2d61da0f7add87e8b6c1d4230f7`),
+probe built with Go 1.26.4
+(sha256 `0362b6a243e46ea66512a21fc3e89cf0f4e92aea0dfdb757b96ce9eeeb48132c`).
+A rebuild is source-identical but not byte-identical (`build.py` does not
+normalise ZIP entry timestamps), so the hash identifies the artifact of the
+recorded run.
 
-### Dedicated server - 26/26 checks passed
+### Dedicated server - 30/30 checks passed
 
 - Vanilla status ping and ping/pong on the game port succeed with the marker
-  sniffer armed (protocol 776, server 26.2).
+  sniffer armed (protocol 776, server 26.2). A second status handshake with a
+  one-character virtual host (10 bytes total, shorter than the marker) also
+  succeeds, pinning the immediate-passthrough fix from review item 1.
 - Two independent Go probes connect to the game port with the marker; both get
   the spike hello, `PING`, `STATE`, hold for 90s, `MARK`, then half-close and
   see the server close its side.
 - `STATE` from probe A shows `control_sessions` going 1 -> 2 while probe B is
   connected, then back down, and both probes see the other session - they are
   concurrent and independent.
+- Both probes receive the pushed `mark` event while advertising
+  `events:chat`/`events:game`, so the capability is not just claimed.
 - A real Minecraft client (offline identity `issue7-player`) joins the same
   server, is visible in the control connections' `STATE` player list and in
   RCON `list`, quits (`lost connection: Disconnected`), reconnects, and quits
   again - all while both control sessions stay connected and continue
   answering `STATE`.
 - No control session ever appears in the player list, a join/leave line or an
-  entity list; RCON `list` is empty before the probes, during gameplay and
-  after everything closes.
+  entity list. RCON `list` is empty before the probes and after everything
+  closes, and shows exactly the real player (never a control session) while
+  that player is online.
+- A third probe is holding a session when the server is stopped gracefully
+  (RCON `stop`); the listener-stop hook closes that session, which is the same
+  cleanup path a LAN unpublish takes.
 
 Key server log excerpt (control sessions bracketing two real player sessions):
 
@@ -173,18 +194,20 @@ same-port control session spike-1 ... closed: channel closed by peer; sessions=0
 same-port control session spike-2 ... closed: channel closed by peer; sessions=1
 ```
 
-### LAN-hosted integrated server - 11/11 checks passed
+### LAN-hosted integrated server - 11/11 checks passed (abrupt close only)
 
 - A real client opens a copied throwaway world in an isolated game directory
   and publishes it to the LAN on an explicit port. The probe connects to the
   **actual** published port (25565), gets hello/`PING`/`STATE`, and the host
   player appears in the control `STATE` player list.
-- Closing the world (killing the host client) drops the control connection;
-  the port stops listening - the probe records a clean disconnect rather than
-  hanging.
-- Reopening the world and publishing to LAN on a different port (25566) makes
-  a new probe connect to that new port; a control connection can also close
-  itself cleanly while the world stays open.
+- **Host process termination** (killing the client JVM, an abrupt world
+  shutdown) drops the control connection and the port stops listening - the
+  probe records the disconnect instead of hanging. This is **not** the
+  in-game "Close LAN"/quit-to-title path and not a same-process reopen; see
+  the limitations.
+- After the terminated host is restarted, publishing to LAN on a different
+  port (25566) makes a new probe connect to that new port; a control
+  connection can also close itself cleanly while the world stays open.
 
 ### Reproduce
 
@@ -192,32 +215,37 @@ same-port control session spike-2 ... closed: channel closed by peer; sessions=1
 # 1. build the mod (Java 25)
 python build.py --minecraft-dir "D:/MC/MC_Game/.minecraft" --version 26.2-Fabric --jdk "<jdk25>"
 
-# 2. build the Go probe
-cd spike/probe && go build -o ../../dist/control-probe .
+# 2. build the Go probe (from its module directory)
+(cd spike/probe && go build -o control-probe.exe .)
 
 # 3. dedicated server + two probes + real client join/quit/reconnect
 python spike/same_port_spike.py dedicated \
     --lab-server <meta>/tools/lab_server.py \
     --lab-root <workdir>/labs \
     --mod-jar dist/mc-agent-interface-0.7.0.jar \
-    --probe dist/control-probe.exe \
+    --probe spike/probe/control-probe.exe \
     --jdk25 "<jdk25>/bin/java.exe" \
     --meta-root <meta> --minecraft-dir "D:/MC/MC_Game/.minecraft" \
     --game-dir <workdir>/client-dedicated --client \
     --evidence-dir <workdir>/evidence-dedicated
 
-# 4. LAN integrated server, close on 25565, reopen on 25566
+# 4. LAN integrated server, terminate the host on 25565, restart on 25566
 python spike/same_port_spike.py lan \
-    ... --game-dir <workdir>/client-lan --lan-port 25565 \
+    ... --game-dir <workdir>/client-lan --lan-port 25565 --force-world \
     --evidence-dir <workdir>/evidence-lan
+
+# unit checks (no game process)
+python test.py --minecraft-dir "D:/MC/MC_Game/.minecraft" --version 26.2-Fabric --jdk "<jdk25>"
+(cd spike/probe && go test ./...)
+python -m unittest discover -s spike -p "test_*.py"
 ```
 
 The raw `RESULT` lines from the probe are JSON and can be checked without the
 driver:
 
 ```bash
-python spike/probe/main.go ...   # or: go run spike/probe -addr host:port -name A -hold 20s
-python spike/mc_ping.py --host 127.0.0.1 --port 25565
+(cd spike/probe && go run . -addr 127.0.0.1:25565 -name A -hold 20s)
+python spike/mc_ping.py --host 127.0.0.1 --port 25565 --handshake-host a
 ```
 
 ## Honest limitations
@@ -235,6 +263,11 @@ python spike/mc_ping.py --host 127.0.0.1 --port 25565
   game process at a time. A remote LAN daemon (another machine) was not used:
   the LAN run dials the LAN port over loopback. Remote control is gated behind
   `mcagent.samePortSpikeAllowRemote` and untested there.
+- **The LAN close path is abrupt host termination, not an in-game close.** The
+  harness has no "close world / unpublish LAN" command, so it kills the host
+  JVM and restarts it in a fresh process. The graceful listener-stop cleanup
+  is verified on the dedicated server (same mixin hook), but the UI
+  quit-to-title path and a same-process world reopen remain unverified.
 - **No TLS / no formal version preamble** is implemented; only the temporary
   ASCII marker is verified.
 - The pre-existing loopback server vantage (`mcagent.serverPort`) still starts;
