@@ -60,6 +60,10 @@ public final class ControlRegressionTests {
         slowConsumerClosesSession();
         eventOrderingIsAtomic();
         crossRunReplayIsReported();
+        pendingStateMachineRace();
+        duplicatePendingIds();
+        outboundBudgetCapsScheduledFrames();
+        oversizedReplyBecomesStructuredError();
         System.out.println("control regressions: " + checks + " checks passed");
     }
 
@@ -140,6 +144,10 @@ public final class ControlRegressionTests {
         final CountDownLatch commandStarted = new CountDownLatch(1);
         final AtomicInteger executed = new AtomicInteger();
         final long largeResultBytes;
+        // Optional barriers for deterministic claim/cancel races.
+        volatile CountDownLatch claimReady;
+        volatile CountDownLatch claimGo;
+        volatile CountDownLatch preClaimGate;
         final java.util.concurrent.ExecutorService gameThread =
                 java.util.concurrent.Executors.newSingleThreadExecutor();
         EventLoopGroup group;
@@ -181,6 +189,26 @@ public final class ControlRegressionTests {
             }
 
             private void runOnGameThread(String operation, JsonObject params, Reply reply) {
+                CountDownLatch readyBarrier = claimReady;
+                if (readyBarrier != null) {
+                    readyBarrier.countDown();
+                }
+                CountDownLatch goBarrier = claimGo;
+                if (goBarrier != null) {
+                    try {
+                        goBarrier.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                CountDownLatch preGate = preClaimGate;
+                if (preGate != null) {
+                    try {
+                        preGate.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
                 if ("command".equals(operation)) {
                     try {
                         if (commandGate != null) {
@@ -583,6 +611,237 @@ public final class ControlRegressionTests {
                 check(replay.get("lost").getAsBoolean(), "a cross-run cursor is reported as lost");
                 check(replay.get("crossRun").getAsBoolean(), "the welcome marks the run mismatch");
                 check(replay.get("from").getAsLong() == 1, "a cross-run replay starts at the new run's first event");
+            }
+        }
+    }
+
+    /**
+     * The queued/running/cancelled transition must be a single atomic step:
+     * whichever side wins, the other observes it and never executes a task the
+     * client was told is safe to retry.
+     */
+    private void pendingStateMachineRace() throws Exception {
+        String property = "mcagent.controlMinRequestTimeoutMillis";
+        String previous = System.getProperty(property);
+        System.setProperty(property, "200");
+        try {
+            // Cancel wins: timeout fires while the task waits at the claim barrier.
+            Path dir = Files.createTempDirectory("mcagent-race-cancel-");
+            CountDownLatch ready = new CountDownLatch(1);
+            CountDownLatch go = new CountDownLatch(1);
+            try (TestServer server = new TestServer(dir, null, null, 0)) {
+                server.claimReady = ready;
+                server.claimGo = go;
+                String token = server.server.auth().issue("race", Set.of("read", "write"), null);
+                try (FrameClient client = new FrameClient(clientContext(dir).getSocketFactory(), server.port)) {
+                    handshake(client, token);
+                    JsonObject params = new JsonObject();
+                    params.addProperty("command", "say race-cancel");
+                    client.send(request("race-cancel", "command", params, 300));
+                    check(ready.await(5, TimeUnit.SECONDS), "the task reached the claim barrier");
+                    JsonObject timeout = client.readReply("race-cancel", 5000);
+                    check("timeout".equals(timeout.getAsJsonObject("error").get("code").getAsString()),
+                            "the queued request timed out: " + timeout);
+                    check(timeout.getAsJsonObject("error").get("retryable").getAsBoolean()
+                                    && !timeout.getAsJsonObject("error").get("resultUnknown").getAsBoolean(),
+                            "a cancelled queued request is safely retryable: " + timeout);
+                    go.countDown();
+                    Thread.sleep(300);
+                    check(server.executed.get() == 0, "the cancelled task never executed");
+                }
+            }
+
+            // Claim wins: the task is running when the timeout fires, so the
+            // client sees result-unknown and the ledger still records the end.
+            Path dir2 = Files.createTempDirectory("mcagent-race-run-");
+            CountDownLatch ready2 = new CountDownLatch(1);
+            CountDownLatch go2 = new CountDownLatch(1);
+            CountDownLatch inflight = new CountDownLatch(1);
+            try (TestServer server = new TestServer(dir2, null, inflight, 0)) {
+                server.claimReady = ready2;
+                server.claimGo = go2;
+                String token = server.server.auth().issue("race2", Set.of("read", "write"), null);
+                SSLContext context = clientContext(dir2);
+                try (FrameClient client = new FrameClient(context.getSocketFactory(), server.port)) {
+                    handshake(client, token);
+                    JsonObject params = new JsonObject();
+                    params.addProperty("command", "say race-run");
+                    client.send(request("race-run", "command", params, 300));
+                    check(ready2.await(5, TimeUnit.SECONDS), "the task reached the claim barrier");
+                    go2.countDown();
+                    check(server.commandStarted.await(5, TimeUnit.SECONDS), "the task claimed the request");
+                    JsonObject unknown = client.readReply("race-run", 5000);
+                    check("timeout".equals(unknown.getAsJsonObject("error").get("code").getAsString())
+                                    && unknown.getAsJsonObject("error").get("resultUnknown").getAsBoolean(),
+                            "a running request reports result-unknown: " + unknown);
+                    inflight.countDown();
+                    Thread.sleep(300);
+                    try (FrameClient reader = new FrameClient(context.getSocketFactory(), server.port)) {
+                        handshake(reader, token);
+                        JsonObject statusParams = new JsonObject();
+                        statusParams.addProperty("requestId", "race-run");
+                        JsonObject status = requestReply(reader, "race-run-s", "request_status", statusParams, 0);
+                        check("completed".equals(status.getAsJsonObject("result").get("state").getAsString()),
+                                "the running request still records its terminal outcome: " + status);
+                    }
+                }
+            }
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
+    }
+
+    /** Duplicate in-flight ids are rejected for reads and writes alike. */
+    private void duplicatePendingIds() throws Exception {
+        Path dir = Files.createTempDirectory("mcagent-dup-id-");
+        try (TestServer server = new TestServer(dir, null, null, 0)) {
+            String token = server.server.auth().issue("dup", Set.of("read", "write"), null);
+            try (FrameClient client = new FrameClient(clientContext(dir).getSocketFactory(), server.port)) {
+                handshake(client, token);
+
+                // read/read collision
+                CountDownLatch gate = new CountDownLatch(1);
+                server.preClaimGate = gate;
+                client.send(request("dup-read", "state", new JsonObject(), 5000));
+                Thread.sleep(100);
+                client.send(request("dup-read", "state", new JsonObject(), 5000));
+                JsonObject collision = client.readReply("dup-read", 5000);
+                check(collision.has("error") && "request_in_flight".equals(
+                                collision.getAsJsonObject("error").get("code").getAsString()),
+                        "a duplicate read id is refused: " + collision);
+                gate.countDown();
+                JsonObject firstRead = client.readReply("dup-read", 5000);
+                check(firstRead.get("ok").getAsBoolean(), "the original read completes: " + firstRead);
+
+                // read/write collision: the command must not claim the ledger.
+                CountDownLatch gate2 = new CountDownLatch(1);
+                server.preClaimGate = gate2;
+                client.send(request("dup-mixed", "state", new JsonObject(), 5000));
+                Thread.sleep(100);
+                JsonObject blocked = new JsonObject();
+                blocked.addProperty("command", "say blocked");
+                client.send(request("dup-mixed", "command", blocked, 5000));
+                JsonObject mixed = client.readReply("dup-mixed", 5000);
+                check(mixed.has("error") && "request_in_flight".equals(
+                                mixed.getAsJsonObject("error").get("code").getAsString()),
+                        "a write cannot take a live read id: " + mixed);
+                check(server.executed.get() == 0, "the colliding write did not execute");
+                gate2.countDown();
+                client.readReply("dup-mixed", 5000);
+                // The id is free again after completion; the write then executes.
+                JsonObject retried = requestReply(client, "dup-mixed", "command", blocked, 0);
+                check(retried.get("ok").getAsBoolean() && server.executed.get() == 1,
+                        "the id is usable after the read finished: " + retried);
+
+                // write/read collision in the other direction.
+                CountDownLatch gate3 = new CountDownLatch(1);
+                server.preClaimGate = gate3;
+                JsonObject writeParams = new JsonObject();
+                writeParams.addProperty("command", "say holds");
+                client.send(request("dup-write", "command", writeParams, 5000));
+                Thread.sleep(100);
+                client.send(request("dup-write", "state", new JsonObject(), 5000));
+                JsonObject reverse = client.readReply("dup-write", 5000);
+                check(reverse.has("error") && "request_in_flight".equals(
+                                reverse.getAsJsonObject("error").get("code").getAsString()),
+                        "a read cannot take a live write id: " + reverse);
+                gate3.countDown();
+                JsonObject writeReply = client.readReply("dup-write", 5000);
+                check(writeReply.get("ok").getAsBoolean(), "the original write completes: " + writeReply);
+            }
+        }
+    }
+
+    /**
+     * The outbound budget must cover frames that are scheduled on the event
+     * loop but not yet written, so a stalled loop cannot accumulate them.
+     */
+    private void outboundBudgetCapsScheduledFrames() throws Exception {
+        String property = "mcagent.controlMaxOutboundBytes";
+        String previous = System.getProperty(property);
+        System.setProperty(property, "131072");
+        try {
+            Path dir = Files.createTempDirectory("mcagent-outbound-");
+            try (TestServer server = new TestServer(dir, null, null, 0)) {
+                String token = server.server.auth().issue("outbound", Set.of("read", "write"), null);
+                try (FrameClient client = new FrameClient(clientContext(dir).getSocketFactory(), server.port)) {
+                    handshake(client, token);
+                    ControlSession session = server.server.sessionsSnapshot().iterator().next();
+                    CountDownLatch stall = new CountDownLatch(1);
+                    session.channel().eventLoop().execute(() -> {
+                        try {
+                            stall.await(10, TimeUnit.SECONDS);
+                        } catch (InterruptedException exception) {
+                            Thread.currentThread().interrupt();
+                        }
+                    });
+                    JsonObject inner = new JsonObject();
+                    inner.addProperty("type", "mark");
+                    inner.addProperty("text", "x".repeat(16 * 1024));
+                    JsonObject envelope = new JsonObject();
+                    envelope.addProperty("type", "event");
+                    envelope.addProperty("seq", 1);
+                    envelope.add("event", inner);
+                    int accepted = 0;
+                    boolean rejected = false;
+                    for (int index = 0; index < 200; index++) {
+                        if (session.sendEvent(envelope, false)) {
+                            accepted++;
+                        } else {
+                            rejected = true;
+                            break;
+                        }
+                    }
+                    check(rejected, "the outbound budget rejected a frame while the loop was stalled");
+                    check(accepted * (16 * 1024) <= 131072 + 64 * 1024,
+                            "scheduled frames stayed within the budget (accepted=" + accepted + ")");
+                    check(session.outboundBytes() <= 131072 + 64 * 1024,
+                            "the budget counter stayed bounded: " + session.outboundBytes());
+                    stall.countDown();
+                    long deadline = System.currentTimeMillis() + 5000;
+                    while (session.channel().isOpen() && System.currentTimeMillis() < deadline) {
+                        Thread.sleep(50);
+                    }
+                    check(!session.channel().isOpen(), "the over-budget session was closed");
+                }
+            }
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
+    }
+
+    /** A result above the frame limit becomes a structured error, not a drop. */
+    private void oversizedReplyBecomesStructuredError() throws Exception {
+        String property = "mcagent.controlMaxFrameBytes";
+        String previous = System.getProperty(property);
+        System.setProperty(property, "4096");
+        try {
+            Path dir = Files.createTempDirectory("mcagent-framesize-");
+            try (TestServer server = new TestServer(dir, null, null, 64 * 1024)) {
+                String token = server.server.auth().issue("framesize", Set.of("read"), null);
+                try (FrameClient client = new FrameClient(clientContext(dir).getSocketFactory(), server.port)) {
+                    handshake(client, token);
+                    JsonObject reply = requestReply(client, "big", "state", new JsonObject(), 0);
+                    check(reply.has("error") && "response_too_large".equals(
+                                    reply.getAsJsonObject("error").get("code").getAsString()),
+                            "an oversized result is a structured error: " + reply);
+                    JsonObject pong = requestReply(client, "ping-after", "ping", new JsonObject(), 0);
+                    check(pong.get("ok").getAsBoolean(), "the session survives a rejected oversized result");
+                }
+            }
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
             }
         }
     }

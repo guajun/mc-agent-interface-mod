@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * One authenticated TLS control session on the game port.
@@ -52,6 +53,7 @@ public final class ControlSession extends ByteToMessageDecoder {
     private final String remoteIp;
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicLong outboundBytes = new AtomicLong();
     private final long openedAtMillis = System.currentTimeMillis();
 
     private volatile ControlAuth.Auth auth;
@@ -94,6 +96,11 @@ public final class ControlSession extends ByteToMessageDecoder {
 
     public long droppedEvents() {
         return droppedEvents;
+    }
+
+    /** Bytes reserved for frames that are queued but not yet written. */
+    long outboundBytes() {
+        return outboundBytes.get();
     }
 
     public String remote() {
@@ -284,31 +291,53 @@ public final class ControlSession extends ByteToMessageDecoder {
                     permissionErrorMessage(operation, current), false, false, null));
             return;
         }
+
+        long timeoutMillis = server.defaultRequestTimeoutMillis();
+        if (frame.has("timeoutMillis") && frame.get("timeoutMillis").isJsonPrimitive()) {
+            timeoutMillis = Math.max(server.minRequestTimeoutMillis(),
+                    Math.min(300_000L, frame.get("timeoutMillis").getAsLong()));
+        }
+        Pending request = new Pending(id, operation, params, write, timeoutMillis);
+        // A duplicate id never overwrites a live request, read or write, and
+        // it is rejected before any ledger reservation so a colliding write
+        // cannot claim or mutate another request's record.
+        Pending live = pending.putIfAbsent(id, request);
+        if (live != null) {
+            sendFrame(replyError(id, "request_in_flight",
+                    "request id " + id + " is already in flight", true, false, null));
+            return;
+        }
+
         if (write) {
             String payloadHash = ControlServer.payloadHash(operation, params);
             ControlServer.Reservation reservation = server.reserveWrite(current.tokenId, id, operation, payloadHash);
             switch (reservation.kind) {
                 case CONFLICT -> {
+                    pending.remove(id, request);
                     sendFrame(replyError(id, "conflict",
                             "request id " + id + " was used before with a different payload", false, false, null));
                     return;
                 }
                 case IN_FLIGHT -> {
+                    pending.remove(id, request);
                     sendFrame(replyError(id, "request_in_flight",
                             "request " + id + " is still running; use request_status", true, false, null));
                     return;
                 }
                 case UNKNOWN_STATE -> {
+                    pending.remove(id, request);
                     sendFrame(replyError(id, "result_unknown",
                             "request " + id + " has an unknown outcome; query request_status", false, true, null));
                     return;
                 }
                 case BUSY -> {
+                    pending.remove(id, request);
                     sendFrame(replyError(id, "server_busy",
                             "the write ledger is full of in-flight requests; retry shortly", true, false, null));
                     return;
                 }
                 case DUPLICATE -> {
+                    pending.remove(id, request);
                     ControlServer.WriteStatus prior = reservation.status;
                     if (prior.state == ControlServer.WriteState.OK) {
                         JsonObject result = prior.result == null ? new JsonObject() : prior.result.deepCopy();
@@ -329,7 +358,8 @@ public final class ControlSession extends ByteToMessageDecoder {
             }
         }
 
-        if (pending.size() >= server.maxPendingRequests()) {
+        if (pending.size() > server.maxPendingRequests()) {
+            pending.remove(id, request);
             if (write) {
                 server.writeAbandoned(current.tokenId, id);
             }
@@ -337,12 +367,6 @@ public final class ControlSession extends ByteToMessageDecoder {
                     "this session already has " + pending.size() + " pending requests", true, false, null));
             return;
         }
-        long timeoutMillis = server.defaultRequestTimeoutMillis();
-        if (frame.has("timeoutMillis") && frame.get("timeoutMillis").isJsonPrimitive()) {
-            timeoutMillis = Math.max(1_000L, Math.min(300_000L, frame.get("timeoutMillis").getAsLong()));
-        }
-        Pending request = new Pending(id, operation, params, write, timeoutMillis);
-        pending.put(id, request);
         request.timeout = channel.eventLoop().schedule(request::onTimeout, timeoutMillis, TimeUnit.MILLISECONDS);
         server.sessionRequestBegan(this);
         if ("ping".equals(operation)) {
@@ -564,23 +588,66 @@ public final class ControlSession extends ByteToMessageDecoder {
     }
 
     /**
-     * Queue one frame. Returns false and closes the session when the outbound
-     * buffer is above its water mark: replies have no queue of their own, so a
-     * reader that cannot drain them must not let them pile up without bound.
+     * Queue one frame under an explicit byte budget that covers frames not yet
+     * run by the event loop. Returns false and closes the session when the
+     * budget or the channel water mark is exceeded; a reply larger than the
+     * protocol frame limit is replaced by a structured error instead of being
+     * written or silently dropped.
      */
     private boolean sendFrame(JsonObject frame) {
         if (closed.get()) {
             return false;
         }
-        if (!channel.isWritable()) {
-            close("slow consumer: outbound buffer full");
+        JsonObject effective = frame;
+        byte[] payload = effective.toString().getBytes(StandardCharsets.UTF_8);
+        if (payload.length > server.maxFrameBytes()) {
+            if (effective.has("id") && effective.get("id").isJsonPrimitive()) {
+                effective = replyError(effective.get("id").getAsString(), "response_too_large",
+                        "the operation result exceeded the " + server.maxFrameBytes()
+                                + " byte frame limit", false, false, null);
+                payload = effective.toString().getBytes(StandardCharsets.UTF_8);
+            } else {
+                close("outbound frame exceeds the frame limit");
+                return false;
+            }
+        }
+        long cost = payload.length + (long) LENGTH_BYTES;
+        long queued = outboundBytes.addAndGet(cost);
+        if (queued > server.maxOutboundBytes() || !channel.isWritable()) {
+            outboundBytes.addAndGet(-cost);
+            close(queued > server.maxOutboundBytes()
+                    ? "outbound budget exceeded" : "slow consumer: outbound buffer full");
             return false;
         }
-        ByteBuf buffer = frameBuffer(frame);
+        ByteBuf buffer = channel.alloc().buffer(LENGTH_BYTES + payload.length);
+        buffer.writeInt(payload.length);
+        buffer.writeBytes(payload);
+        io.netty.channel.ChannelFuture future;
         if (channel.eventLoop().inEventLoop()) {
-            channel.writeAndFlush(buffer);
-        } else {
-            channel.eventLoop().execute(() -> channel.writeAndFlush(buffer));
+            future = channel.writeAndFlush(buffer);
+            future.addListener(written -> {
+                outboundBytes.addAndGet(-cost);
+                if (!written.isSuccess()) {
+                    close("write failed: " + written.cause());
+                }
+            });
+            return true;
+        }
+        try {
+            channel.eventLoop().execute(() -> {
+                io.netty.channel.ChannelFuture queuedWrite = channel.writeAndFlush(buffer);
+                queuedWrite.addListener(written -> {
+                    outboundBytes.addAndGet(-cost);
+                    if (!written.isSuccess()) {
+                        close("write failed: " + written.cause());
+                    }
+                });
+            });
+        } catch (RuntimeException exception) {
+            buffer.release();
+            outboundBytes.addAndGet(-cost);
+            close("cannot queue outbound frame: " + exception);
+            return false;
         }
         return true;
     }
@@ -699,18 +766,23 @@ public final class ControlSession extends ByteToMessageDecoder {
         return fallback;
     }
 
-    /** One in-flight request. */
+    /**
+     * One in-flight request with a single atomic state machine: a queued
+     * request can become RUNNING (claimed by the game thread) or CANCELLED
+     * (timeout before start, disconnect, or a failed authorization). Only the
+     * owner of that transition may act, so a timeout can never report "safe
+     * retry" while the game thread is already executing, and a cancelled task
+     * can never run.
+     */
     private final class Pending implements ControlOps.Reply {
         private final String id;
         private final String operation;
         private final JsonObject params;
         private final boolean write;
         private final long timeoutMillis;
-        private final AtomicBoolean finished = new AtomicBoolean();
-        private final AtomicBoolean cancelled = new AtomicBoolean();
-        private volatile boolean started;
-        private volatile boolean timedOut;
-        private volatile ScheduledFuture<?> timeout;
+        private RequestState state = RequestState.QUEUED;
+        private boolean timedOut;
+        private ScheduledFuture<?> timeout;
 
         Pending(String id, String operation, JsonObject params, boolean write, long timeoutMillis) {
             this.id = id;
@@ -722,16 +794,17 @@ public final class ControlSession extends ByteToMessageDecoder {
 
         /**
          * Claim the operation on the game thread. Returns false when the
-         * request was cancelled (timeout before start or session close), so the
-         * queued game task is skipped instead of running after a "safe retry"
-         * was already promised.
+         * request is no longer QUEUED, so the queued game task is skipped
+         * instead of running after a cancel/advertised retry.
          */
         @Override
         public boolean started() {
-            if (cancelled.get() || finished.get()) {
-                return false;
+            synchronized (this) {
+                if (state != RequestState.QUEUED) {
+                    return false;
+                }
+                state = RequestState.RUNNING;
             }
-            started = true;
             if (!authorizedNow(operation, auth)) {
                 fail("unauthorized", "the credential was revoked or no longer permits " + operation,
                         false, false);
@@ -742,7 +815,7 @@ public final class ControlSession extends ByteToMessageDecoder {
 
         @Override
         public void ok(JsonElement result) {
-            if (!finishToken()) {
+            if (!finish()) {
                 return;
             }
             cancelTimeout();
@@ -770,7 +843,7 @@ public final class ControlSession extends ByteToMessageDecoder {
         @Override
         public void fail(String code, String message, boolean retryable, boolean resultUnknown,
                          JsonObject details) {
-            if (!finishToken()) {
+            if (!finish()) {
                 return;
             }
             cancelTimeout();
@@ -791,18 +864,21 @@ public final class ControlSession extends ByteToMessageDecoder {
             gone();
         }
 
-        /** The client gave up waiting. Keep the operation; report what we know. */
+        /** The client gave up waiting before the game thread claimed it. */
         private void onTimeout() {
-            if (finished.get()) {
-                return;
+            boolean cancelNow;
+            synchronized (this) {
+                if (state == RequestState.QUEUED) {
+                    state = RequestState.CANCELLED;
+                    cancelNow = true;
+                } else if (state == RequestState.RUNNING) {
+                    timedOut = true;
+                    cancelNow = false;
+                } else {
+                    return; // DONE or CANCELLED: nothing to report
+                }
             }
-            timedOut = true;
-            if (!started) {
-                // The game thread has not claimed it: cancel so the queued
-                // task is skipped, and drop the ledger entry so a retry with
-                // this id can execute.
-                cancelled.set(true);
-                finishToken();
+            if (cancelNow) {
                 if (write) {
                     server.writeAbandoned(auth.tokenId, id);
                 }
@@ -833,17 +909,19 @@ public final class ControlSession extends ByteToMessageDecoder {
         }
 
         /**
-         * The socket is gone. Delivery stops, but a request that already
-         * started keeps running and its terminal outcome is still recorded in
-         * the ledger; an unstarted queued request is cancelled and retryable.
+         * The socket is gone. An unclaimed request is cancelled and becomes
+         * retryable; a running request keeps running and still records its
+         * terminal outcome for request_status.
          */
         private void onSessionClosed() {
-            if (finished.get()) {
-                return;
+            boolean cancelNow;
+            synchronized (this) {
+                cancelNow = state == RequestState.QUEUED;
+                if (cancelNow) {
+                    state = RequestState.CANCELLED;
+                }
             }
-            if (!started) {
-                cancelled.set(true);
-                finishToken();
+            if (cancelNow) {
                 if (write) {
                     server.writeAbandoned(auth.tokenId, id);
                 }
@@ -852,12 +930,20 @@ public final class ControlSession extends ByteToMessageDecoder {
             cancelTimeout();
         }
 
-        private boolean finishToken() {
-            return finished.compareAndSet(false, true);
+        private boolean finish() {
+            synchronized (this) {
+                if (state == RequestState.DONE || state == RequestState.CANCELLED) {
+                    return false;
+                }
+                state = RequestState.DONE;
+                return true;
+            }
         }
 
         private void gone() {
-            pending.remove(id);
+            // Conditional remove: never delete a different request that
+            // somehow shares this id.
+            pending.remove(id, this);
             server.sessionRequestFinished(ControlSession.this);
         }
 
@@ -867,5 +953,12 @@ public final class ControlSession extends ByteToMessageDecoder {
                 current.cancel(false);
             }
         }
+    }
+
+    private enum RequestState {
+        QUEUED,
+        RUNNING,
+        DONE,
+        CANCELLED
     }
 }

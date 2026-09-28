@@ -60,7 +60,9 @@ public final class ControlServer {
     public static final String PROPERTY_EVENT_BUFFER = "mcagent.controlEventBuffer";
     public static final String PROPERTY_MAX_PENDING = "mcagent.controlMaxPending";
     public static final String PROPERTY_REQUEST_TIMEOUT_MILLIS = "mcagent.controlRequestTimeoutMillis";
+    public static final String PROPERTY_MIN_REQUEST_TIMEOUT_MILLIS = "mcagent.controlMinRequestTimeoutMillis";
     public static final String PROPERTY_MAX_DROPPED = "mcagent.controlMaxDroppedEvents";
+    public static final String PROPERTY_MAX_OUTBOUND_BYTES = "mcagent.controlMaxOutboundBytes";
     static final String BOOTSTRAP_FILE = "bootstrap-token.txt";
 
     public static final int CONTROL_PROTOCOL_VERSION = 1;
@@ -425,11 +427,27 @@ public final class ControlServer {
     }
 
     long defaultRequestTimeoutMillis() {
-        return Math.max(1_000L, Long.getLong(PROPERTY_REQUEST_TIMEOUT_MILLIS, 30_000L));
+        return Math.max(minRequestTimeoutMillis(),
+                Long.getLong(PROPERTY_REQUEST_TIMEOUT_MILLIS, 30_000L));
+    }
+
+    /** Test/latency floor for per-request timeouts (production default is 1s). */
+    long minRequestTimeoutMillis() {
+        return Math.max(1L, Long.getLong(PROPERTY_MIN_REQUEST_TIMEOUT_MILLIS, 1_000L));
     }
 
     long maxDroppedEvents() {
         return Math.max(16L, Long.getLong(PROPERTY_MAX_DROPPED, 4096L));
+    }
+
+    /** Bytes a session may have queued (including scheduled, not-yet-written frames). */
+    long maxOutboundBytes() {
+        return Math.max(64 * 1024L, Long.getLong(PROPERTY_MAX_OUTBOUND_BYTES, 4L * 1024 * 1024));
+    }
+
+    /** Test/diagnostic view of the live sessions. */
+    java.util.Collection<ControlSession> sessionsSnapshot() {
+        return new ArrayList<>(sessions.values());
     }
 
     int maxAuthFailuresPerWindow() {

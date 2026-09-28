@@ -153,9 +153,10 @@ never be treated as local paths.
 
 Timeout semantics are explicit. A client that gives up sends nothing further
 for that id; a `timeout` reply carries `retryable` and `resultUnknown`.
-A request that has not been claimed by the game thread is cancelled: the
-queued game task checks the claim first and does not run, the ledger entry is
-dropped, and the client may safely retry. A request that already started
+The queued/running/cancelled transition is one atomic step: whichever side
+wins, the other observes it. A request that has not been claimed by the game
+thread is cancelled (the queued game task sees the cancelled state and does
+not run), the ledger entry is dropped, and the client may safely retry. A request that already started
 reports `resultUnknown=true` and keeps its pending ledger record until the
 game thread finishes, so `request_status` can resolve it later. A running
 request still counts against the session's pending budget after a timeout, so
@@ -163,7 +164,9 @@ a slow client cannot pile unbounded work onto the game thread.
 
 ### Writes, ordering and result-unknown recovery
 
-Writes are `command`, `mark` and `snapshot`. Each write id is reserved
+Duplicate in-flight request ids are rejected before any ledger reservation,
+for reads and writes alike, so a second request can never overwrite a live
+one. Writes are `command`, `mark` and `snapshot`. Each write id is reserved
 atomically before anything else happens:
 
 - the first use of an id creates a `pending` record;
@@ -241,11 +244,14 @@ events, so the next reconnect always produces a machine-readable replay report.
 | `mcagent.controlRequestTimeoutMillis` | 30000 | default operation deadline |
 | `mcagent.controlEventBuffer` | 1024 | replay ring size |
 | `mcagent.controlMaxDroppedEvents` | 4096 | retained for diagnostics; a session that cannot drain is closed |
+| `mcagent.controlMaxOutboundBytes` | 4 MiB | byte budget covering frames queued but not yet written |
+| `mcagent.controlMinRequestTimeoutMillis` | 1000 | floor for a per-request `timeoutMillis` |
 
-Replies and events share a bounded outbound path: any frame queued while the
-channel is above its write-buffer water mark closes the session instead of
-growing an unbounded queue, and the game thread is never blocked by a slow
-reader.
+Replies and events share one outbound byte budget that also covers frames
+scheduled on the event loop but not yet written, so a stalled loop or reader
+cannot accumulate unbounded buffers; exceeding the budget or a frame limit
+closes the session or turns an oversized reply into a structured
+`response_too_large` error. The game thread is never blocked by a slow reader.
 
 Game operations are always executed on the server thread; the network side
 only frames, authenticates and queues.
