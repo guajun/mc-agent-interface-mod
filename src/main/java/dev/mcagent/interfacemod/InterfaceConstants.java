@@ -8,8 +8,9 @@ package dev.mcagent.interfacemod;
  */
 public final class InterfaceConstants {
     public static final String MOD_ID = "mc-agent-interface";
-    public static final String VERSION = "0.7.0";
+    public static final String VERSION = "0.8.0";
     public static final int PROTOCOL_VERSION = 1;
+    public static final String MINECRAFT_VERSION = "26.2";
 
     public static final int DEFAULT_CLIENT_PORT = 25580;
     public static final int DEFAULT_SERVER_PORT = 25581;

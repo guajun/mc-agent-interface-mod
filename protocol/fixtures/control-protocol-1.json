@@ -1,0 +1,226 @@
+{
+  "protocol": 1,
+  "description": "Canonical mc-agent control protocol 1 frames. Both implementations (Java server, Go daemon) are exercised end to end; these fixtures let a third client be checked without reading either codebase. Field order is not significant. All frames are sent as uint32 big-endian length + UTF-8 JSON.",
+  "frames": {
+    "hello": {
+      "type": "hello",
+      "protocol": 1,
+      "token": "mca1.tk_ab12cd34ef56.AD-CkgYXzqbii5UqaRwbT7etJQiHSKM-yCkybT6U",
+      "lastSeq": 42,
+      "client": {
+        "name": "mc-agent",
+        "version": "0.5.0"
+      },
+      "runId": "run_824732565fd44d07"
+    },
+    "welcome": {
+      "type": "welcome",
+      "protocol": 1,
+      "mod": "mc-agent-interface",
+      "modVersion": "0.8.0",
+      "minecraft": "26.2",
+      "instanceId": "inst_ee8e3e5b0adb44ca",
+      "runId": "run_824732565fd44d07",
+      "runStartedAtMillis": 1790585489000,
+      "sessionId": "sess_b7be55ef9e354abb",
+      "transport": "same-port-tls",
+      "serverTimeMillis": 1790585489500,
+      "permissions": [
+        "read",
+        "write"
+      ],
+      "capabilities": [
+        "state",
+        "entities",
+        "player",
+        "player:view",
+        "command",
+        "context",
+        "wait",
+        "mark",
+        "snapshot",
+        "events:game",
+        "events:chat"
+      ],
+      "replay": {
+        "requestedSince": 42,
+        "from": 43,
+        "to": 57,
+        "lost": false,
+        "bufferedEvents": 15,
+        "persistedAcrossRuns": false,
+        "crossRun": false
+      },
+      "limits": {
+        "maxFrameBytes": 16777216,
+        "maxPendingRequests": 32,
+        "requestTimeoutMillis": 30000,
+        "idleSeconds": 300,
+        "handshakeSeconds": 10,
+        "eventBuffer": 1024,
+        "maxDroppedEvents": 4096,
+        "controlProtocol": 1
+      }
+    },
+    "fatalError": {
+      "type": "error",
+      "code": "unauthorized",
+      "message": "the access credential was rejected"
+    },
+    "request": {
+      "type": "request",
+      "id": "c1",
+      "op": "command",
+      "params": {
+        "command": "say hello"
+      }
+    },
+    "replyOk": {
+      "type": "reply",
+      "ok": true,
+      "id": "c1",
+      "result": {
+        "type": "cmd_ack",
+        "detail": "say hello",
+        "output": [
+          "[Server] hello"
+        ],
+        "writeSeq": 4,
+        "duplicate": false,
+        "requestId": "c1"
+      },
+      "serverTimeMillis": 1790585489600
+    },
+    "replyDuplicate": {
+      "type": "reply",
+      "ok": true,
+      "id": "c1",
+      "result": {
+        "type": "cmd_ack",
+        "detail": "say hello",
+        "output": [
+          "[Server] hello"
+        ],
+        "writeSeq": 4,
+        "duplicate": true,
+        "requestId": "c1"
+      },
+      "serverTimeMillis": 1790585489700
+    },
+    "replyError": {
+      "type": "reply",
+      "ok": false,
+      "id": "c2",
+      "error": {
+        "code": "forbidden",
+        "message": "this credential has no write permission",
+        "retryable": false,
+        "resultUnknown": false
+      }
+    },
+    "replyTimeoutUnknown": {
+      "type": "reply",
+      "ok": false,
+      "id": "c3",
+      "error": {
+        "code": "timeout",
+        "message": "operation command is still running; its result is unknown, query request_status",
+        "retryable": false,
+        "resultUnknown": true
+      }
+    },
+    "replyConflict": {
+      "type": "reply",
+      "ok": false,
+      "id": "l1",
+      "error": {
+        "code": "conflict",
+        "message": "exclusive key 'freeze' is held by another credential",
+        "retryable": true,
+        "resultUnknown": false,
+        "details": {
+          "holder": {
+            "key": "freeze",
+            "holderTokenId": "tk_other",
+            "holderSessionId": "sess_other",
+            "holderLabel": "daemon-a",
+            "acquiredAtMillis": 1790585400000,
+            "expiresAtMillis": 1790585700000,
+            "renewals": 0
+          }
+        }
+      }
+    },
+    "requestStatus": {
+      "type": "request",
+      "id": "s1",
+      "op": "request_status",
+      "params": {
+        "requestId": "c1"
+      }
+    },
+    "replyStatus": {
+      "type": "reply",
+      "ok": true,
+      "id": "s1",
+      "result": {
+        "requestId": "c1",
+        "operation": "command",
+        "state": "completed",
+        "beganAtMillis": 1790585489500,
+        "updatedAtMillis": 1790585489600,
+        "result": {
+          "type": "cmd_ack",
+          "writeSeq": 4
+        }
+      }
+    },
+    "event": {
+      "type": "event",
+      "seq": 13,
+      "runId": "run_824732565fd44d07",
+      "streamId": "run_824732565fd44d07",
+      "serverTimeMillis": 1790585489700,
+      "event": {
+        "type": "chat",
+        "event": true,
+        "millis": 1790585489700,
+        "text": "hello",
+        "sender": "Alice"
+      }
+    },
+    "writeEvent": {
+      "type": "event",
+      "seq": 14,
+      "runId": "run_824732565fd44d07",
+      "streamId": "run_824732565fd44d07",
+      "serverTimeMillis": 1790585489700,
+      "event": {
+        "type": "write",
+        "writeSeq": 4,
+        "op": "command",
+        "requestId": "c1",
+        "tokenId": "tk_ab12cd34ef56",
+        "ok": true,
+        "millis": 1790585489700
+      }
+    },
+    "replayedEvent": {
+      "type": "event",
+      "seq": 43,
+      "runId": "run_824732565fd44d07",
+      "streamId": "run_824732565fd44d07",
+      "replay": true,
+      "event": {
+        "type": "game",
+        "event": true,
+        "text": "a missed event"
+      }
+    }
+  },
+  "notes": {
+    "sniffing": "The first two bytes of a TLS record (0x16 0x03) select the control transport; anything else is vanilla Minecraft.",
+    "replayLost": "When welcome.replay.lost is true, replayed frames start at welcome.replay.from and older events are gone; a daemon must report the gap and must not claim a complete stream.",
+    "resultUnknown": "A timed-out write with resultUnknown=true must be resolved with request_status; it must never be replayed blindly. request_status state values are pending, completed, failed and unknown (unknown after a game restart)."
+  }
+}

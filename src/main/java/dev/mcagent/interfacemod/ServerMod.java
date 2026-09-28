@@ -1,5 +1,7 @@
 package dev.mcagent.interfacemod;
 
+import dev.mcagent.interfacemod.control.ControlCommands;
+import dev.mcagent.interfacemod.control.ControlServer;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
@@ -25,14 +27,19 @@ public final class ServerMod implements ModInitializer {
         int port = Integer.getInteger("mcagent.serverPort", InterfaceConstants.DEFAULT_SERVER_PORT);
 
         SamePortControl.logConfiguration();
+        ControlCommands.register();
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             core = new ServerCore(server, dir, port);
+            if (ControlServer.enabled()) {
+                ControlServer.attach(core, dir.resolve("control"));
+            }
             core.start();
             SamePortControl.attach(core);
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             SamePortControl.closeAll("server stopping");
             SamePortControl.detach();
+            ControlServer.detach();
             if (core != null) {
                 core.stop();
                 core = null;

@@ -201,6 +201,15 @@ public final class SamePortControl {
         }
     }
 
+    /**
+     * Detach the never-handshaked placeholder {@link Connection} of a control
+     * socket. The formal TLS transport (issue #8) shares this seam with the
+     * spike instead of duplicating the listener accessor.
+     */
+    public static void detachPlaceholder(Connection connection) {
+        detachVanilla(connection);
+    }
+
     private static boolean remoteAllowed(Channel channel) {
         if (Boolean.getBoolean(PROPERTY_ALLOW_REMOTE)) {
             return true;

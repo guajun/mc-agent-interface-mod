@@ -1,6 +1,7 @@
 package dev.mcagent.interfacemod.mixin;
 
 import dev.mcagent.interfacemod.SamePortControl;
+import dev.mcagent.interfacemod.control.ControlServer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.local.LocalChannel;
 import net.minecraft.network.Connection;
@@ -13,7 +14,9 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Arms the issue #7 same-port control sniffer on real TCP server connections.
+ * Arms the same-port control transports on real TCP server connections: the
+ * formal TLS sniffer from issue #8 (when enabled) in front of the issue #7
+ * spike sniffer (when enabled).
  *
  * <p>{@code Connection.configurePacketHandler} is the single point where a
  * serverbound connection gets its {@code packet_handler}, and the mixin runs
@@ -46,6 +49,6 @@ public abstract class SamePortConnectionMixin {
         if (pipeline.channel() instanceof LocalChannel) {
             return;
         }
-        SamePortControl.armChannel(pipeline, (Connection) (Object) this);
+        ControlServer.armChannel(pipeline, (Connection) (Object) this);
     }
 }
