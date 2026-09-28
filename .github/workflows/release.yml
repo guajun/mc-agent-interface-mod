@@ -1,0 +1,210 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "build.py"
+      - "test.py"
+      - "src/**"
+      - "ci/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: resolve the source commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: resolve the release tag
+        id: resolve
+        shell: bash
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          [ -n "$TAG" ] || { echo "no release tag was provided" >&2; exit 1; }
+          git fetch --force --tags origin
+          git fetch origin main
+          git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1 || { echo "tag $TAG does not exist" >&2; exit 1; }
+          SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          git merge-base --is-ancestor "$SHA" origin/main || {
+            echo "tag $TAG ($SHA) is not reachable from origin/main" >&2
+            exit 1
+          }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build and verify the mod jar
+    needs: resolve
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: verify checkout provenance
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          [ "$HEAD_SHA" = "$EXPECTED_SHA" ] || { echo "checkout $HEAD_SHA != resolved $EXPECTED_SHA" >&2; exit 1; }
+      - name: resolve version and tag
+        id: version
+        shell: bash
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          VERSION="$(python -c "import json;print(json.load(open('src/main/resources/fabric.mod.json'))['version'])")"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="$TAG_INPUT"
+          fi
+          if [ -n "$TAG" ] && [ "$TAG" != "v$VERSION" ]; then
+            echo "tag $TAG does not match fabric.mod.json version $VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: cache Minecraft and Fabric inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci-minecraft/libraries
+            .ci-minecraft/versions
+            .ci-minecraft/mods
+          key: minecraft-26.2-fabric-0.19.5-api-0.161.0
+      - name: prepare the build-only Minecraft directory
+        run: |
+          python ci/prepare_minecraft.py --minecraft-dir .ci-minecraft \
+            --version 26.2 --loader 0.19.5 --fabric-api 0.161.0
+      - name: unit tests
+        run: |
+          python test.py --minecraft-dir .ci-minecraft --version 26.2-Fabric --jdk "$JAVA_HOME"
+      - name: build the jar
+        run: |
+          python build.py --minecraft-dir .ci-minecraft --version 26.2-Fabric \
+            --jdk "$JAVA_HOME" --output dist
+      - name: verify the jar
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python ci/verify_jar.py --jar "dist/mc-agent-interface-$VERSION.jar" \
+            --version "$VERSION" ${TAG:+--tag "$TAG"}
+      - name: write checksums
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd dist
+          sha256sum "mc-agent-interface-$VERSION.jar" > checksums.txt
+          cat checksums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mod-release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub release
+    needs: [resolve, build]
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: mod-release-assets
+          path: dist
+      - name: verify source provenance
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          [ "$HEAD_SHA" = "$EXPECTED_SHA" ] || { echo "checkout $HEAD_SHA != resolved $EXPECTED_SHA" >&2; exit 1; }
+          python - "$VERSION" <<'PY'
+          import json, sys, zipfile
+          version = sys.argv[1]
+          with zipfile.ZipFile(f"dist/mc-agent-interface-{version}.jar") as archive:
+              metadata = json.loads(archive.read("fabric.mod.json"))
+          if metadata["version"] != version:
+              raise SystemExit(f"jar version {metadata['version']} != {version}")
+          print(f"provenance ok: mod {version}")
+          PY
+      - name: create the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          mc-agent-interface ${VERSION} - Fabric mod for Minecraft 26.2.
+
+          One jar, client and server entrypoints:
+          - server vantage: authenticated control transport (control protocol 1) on the actual game port;
+          - client vantage: legacy loopback adapter for client-only operations.
+
+          Tested stack: Minecraft 26.2, Fabric Loader 0.19.5, Fabric API 0.161.0, Java 25.
+          Enable the control transport with -Dmcagent.control=true.
+
+          Verify before installing:
+
+          \`\`\`bash
+          sha256sum -c checksums.txt
+          \`\`\`
+
+          Install the jar next to Fabric API in the instance's mods/ directory
+          (exactly one interface version). See the repository README and the
+          Toolkit documentation at https://guajun.github.io/mc-agent/.
+          EOF
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --verify-tag \
+            dist/*

@@ -10,6 +10,24 @@ use-case logic (no cannon, sulfur cube, pathfinding, or analysis code). It only
 answers questions about the game and performs explicit actions requested by a
 client.
 
+## Install
+
+Download `mc-agent-interface-0.8.0.jar` and `checksums.txt` from the
+[releases page](https://github.com/guajun/mc-agent-interface-mod/releases),
+verify the SHA-256, and put the jar next to Fabric API in the instance's
+`mods/` directory (exactly one interface version):
+
+```bash
+sha256sum -c checksums.txt          # Linux
+shasum -a 256 -c checksums.txt      # macOS
+```
+
+The tested stack is Minecraft 26.2, Fabric Loader 0.19.5, Fabric API 0.161.0
+and Java 25. Enable the authenticated same-port control transport with
+`-Dmcagent.control=true` (see [the Toolkit guide](https://guajun.github.io/mc-agent/)).
+Building from source is documented under [Build](#build); the release workflow
+and asset checks are in [docs/release.md](docs/release.md).
+
 ## Protocol v1
 
 The mod listens on `127.0.0.1:25580` by default (it tries the next free port if
@@ -19,7 +37,7 @@ Messages are UTF-8 text, one JSON object per line.
 On connect the mod sends:
 
 ```json
-{"type":"hello","mod":"mc-agent-interface","version":"0.7.0","protocol":1,
+{"type":"hello","mod":"mc-agent-interface","version":"0.8.0","protocol":1,
  "minecraft":"26.2","port":25580,
  "capabilities":["state","entities","command","chat","record","wait","screen",
                   "mark","connect","events:chat","events:game"]}
@@ -308,7 +326,8 @@ python build.py \
   --jdk "C:/Program Files/Java/jdk-25"
 ```
 
-Output: `dist/mc-agent-interface-0.7.0.jar`. Put it together with
+Output: `dist/mc-agent-interface-0.8.0.jar` (the version comes from
+`src/main/resources/fabric.mod.json`). Put it together with
 `fabric-api-*.jar` into the client's `mods/` directory.
 
 ## Tests
