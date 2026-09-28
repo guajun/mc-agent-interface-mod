@@ -274,9 +274,12 @@ writes, exclusive leases, limits and the support matrix - lives in
 [`protocol/fixtures/control-protocol-1.json`](protocol/fixtures/control-protocol-1.json).
 
 First start with no credentials issues one bootstrap `read+write` credential
-and logs it once; provision per-daemon credentials afterwards with
+and writes it to `control/bootstrap-token.txt` (owner-only; the log only points
+at the file); provision per-daemon credentials afterwards with
 `/mcagent control token add <label> read|write` and revoke them with
-`/mcagent control token revoke <id>`.
+`/mcagent control token revoke <id>`. Credential administration is
+console-only: a remote write credential runs ordinary game commands at ADMIN
+level but cannot reach the owner-only `/mcagent control` subtree.
 
 Administration and lifecycle:
 

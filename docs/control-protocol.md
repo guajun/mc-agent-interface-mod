@@ -50,16 +50,27 @@ Administration happens on the server console (permission level 3+):
 Credentials are stored as salted SHA-256 hashes in
 `<gameDir>/mc-agent-server/control/tokens.json`; the secret is shown exactly
 once in the form `mca1.<id>.<base64url>`. On a server that has no usable
-credential, the mod issues one `read+write` bootstrap credential and logs it
-once with a loud line - revoke it after issuing per-daemon credentials.
+credential, the mod issues one `read+write` bootstrap credential and writes it
+to `<gameDir>/mc-agent-server/control/bootstrap-token.txt` (owner-only); the
+normal log only points at that file. Move the secret to the daemon operator and
+delete the file; revoke the bootstrap credential after issuing per-daemon
+credentials.
 
 A token carries `read` and/or `write`. Read covers state, entities, player
-context, chat context bundles, snapshots and `request_status`; write covers
-`command`, `chat`/`mark` where the vantage supports them, and `snapshot`.
-Revocation closes every live session that uses the credential and releases its
-exclusive leases; rotation is "issue the replacement, update the daemon,
-revoke the old one". Chat identity is never an authorization: permissions come
-from the credential.
+context, chat context bundles, snapshots and the event stream; write covers
+`command`, `mark` and `snapshot`. Events are read data: a write-only credential
+receives no pushed events and no replay. Revocation, expiry and permission
+changes are checked against the live store before every operation, a queued
+write that is revoked before the game thread claims it is cancelled instead of
+running, and a running write that is cancelled by expiry is closed while its
+terminal outcome stays recorded. Chat identity is never an authorization:
+permissions come from the credential.
+
+**Credential administration is console-only.** A remote `write` credential may
+run ordinary game commands at ADMIN level, but the `/mcagent control token ...`
+subtree requires OWNER, so direct calls and `/execute`/`/function` chains
+cannot mint or revoke credentials. The local legacy loopback adapter keeps the
+owner-level command source because it is already bound to the server machine.
 
 ## Framing
 
@@ -78,8 +89,14 @@ The first client frame is:
 
 ```json
 {"type":"hello","protocol":1,"token":"mca1.tok_ab12.<secret>",
- "lastSeq":42,"client":{"name":"mc-agent","version":"0.5.0"}}
+ "lastSeq":42,"runId":"run_...","client":{"name":"mc-agent","version":"0.5.0"}}
 ```
+
+`runId` is optional and scopes the cursor: it names the run `lastSeq` belongs
+to. When it differs from the server's run, the cursor is not used and the
+replay is reported as a cross-run gap (see below), so a reconnecting daemon
+can never present a previous run's high-water mark to a restarted game and
+silently skip the new run's events.
 
 The server answers with `welcome` (or a fatal `error`, then closes):
 
@@ -90,8 +107,8 @@ The server answers with `welcome` (or a fatal `error`, then closes):
  "permissions":["read","write"],
  "capabilities":["state","entities","player","player:view","command","context",
                  "wait","mark","snapshot","events:game","events:chat"],
- "replay":{"requestedSince":42,"from":43,"to":57,"lost":false,
-           "bufferedEvents":15,"persistedAcrossRuns":false},
+ `replay":{"requestedSince":42,"from":43,"to":57,"lost":false,
+           "bufferedEvents":15,"persistedAcrossRuns":false,"crossRun":false},
  "limits":{"maxFrameBytes":16777216,"maxPendingRequests":32,
            "requestTimeoutMillis":30000,"idleSeconds":300,
            "handshakeSeconds":10,"eventBuffer":1024,"maxDroppedEvents":4096,
@@ -99,9 +116,11 @@ The server answers with `welcome` (or a fatal `error`, then closes):
 ```
 
 `instanceId` is stable across restarts of the same server directory; `runId`
-changes on every server start. `replay.lost=true` means events older than the
-in-memory buffer (or from a previous run) cannot be replayed. Events are never
-persisted across restarts and that is reported, not hidden.
+changes on every server start and when an integrated server halts (a reopened
+single-player world is a new run). `replay.lost=true` means events older than
+the in-memory buffer cannot be replayed; `replay.crossRun=true` means the
+client's cursor belonged to another run. Events are never persisted across
+restarts and that is reported, not hidden.
 
 ## Requests, replies and errors
 
@@ -122,24 +141,41 @@ Error codes include `bad_request`, `unauthorized`, `forbidden`,
 
 Supported server-vantage operations are `ping`, `capabilities`, `state`,
 `entities`, `player`, `context`, `command`, `mark`, `wait`, `snapshot`,
-`snapshots`, `request_status`, and the `exclusive_*` leases. Composite
-`fork`/`restore`/`freeze`/`verify`/`order` operations are **not** implemented
-over this transport: they are refused with `capability_not_supported` and a
-reason, because a complete freeze/snapshot/fork semantics has not been designed
-yet (mc-agent#39), and remote world paths must never be treated as local
-paths.
+`snapshots`, `request_status`, and the `exclusive_*` leases. `snapshot` names
+are single safe directory segments: absolute paths, `..`, separators, reserved
+device names and symlinked directories are rejected before anything is written,
+and the resolved directory is proven to stay inside the instance's own
+`snapshots/` root. Composite `fork`/`restore`/`freeze`/`verify`/`order`
+operations are **not** implemented over this transport: they are refused with
+`capability_not_supported` and a reason, because a complete freeze/snapshot/fork
+semantics has not been designed yet (mc-agent#39), and remote world paths must
+never be treated as local paths.
 
 Timeout semantics are explicit. A client that gives up sends nothing further
 for that id; a `timeout` reply carries `retryable` and `resultUnknown`.
-If the game operation had not started, `retryable=true, resultUnknown=false`
-and a retry is safe. If it was running, `resultUnknown=true` and the client
-must **not** blindly replay it.
+A request that has not been claimed by the game thread is cancelled: the
+queued game task checks the claim first and does not run, the ledger entry is
+dropped, and the client may safely retry. A request that already started
+reports `resultUnknown=true` and keeps its pending ledger record until the
+game thread finishes, so `request_status` can resolve it later. A running
+request still counts against the session's pending budget after a timeout, so
+a slow client cannot pile unbounded work onto the game thread.
 
 ### Writes, ordering and result-unknown recovery
 
-Writes are `command`, `chat`, `mark` and `snapshot`. The server assigns each
-completed write a monotonic `writeSeq`, returns it in the reply result, and
-publishes a sequenced `write` event:
+Writes are `command`, `mark` and `snapshot`. Each write id is reserved
+atomically before anything else happens:
+
+- the first use of an id creates a `pending` record;
+- the same id with a different payload is `conflict` and is never executed;
+- the same id with the same payload while running is `request_in_flight`;
+- the same id with the same payload after completion is the stored result with
+  `"duplicate":true`;
+- pending records are never evicted; a full ledger returns `server_busy`
+  instead of dropping a status.
+
+The server assigns each completed write a monotonic `writeSeq`, returns it in
+the reply result, and publishes a sequenced `write` event:
 
 ```json
 {"type":"event","seq":12,"runId":"run_...","streamId":"run_...",
@@ -147,14 +183,15 @@ publishes a sequenced `write` event:
           "tokenId":"tk_...","ok":true,"millis":0}}
 ```
 
-Replies are de-duplicated per `(token id, request id)`: resending the same id
-returns the stored result with `"duplicate":true` instead of executing again.
+Replies are de-duplicated per `(token id, request id)` as described above.
 `request_status` with `{"requestId":"c1"}` answers
 `{"requestId":"c1","state":"pending|completed|failed|unknown",...}` from a
-bounded (1024 entries, 30 minutes) server-side ledger, so a daemon that
-reconnects can resolve a write whose reply was lost. The ledger covers the
-current run only; after a game restart `state` is `unknown` and a blind retry
-is not safe.
+bounded (1024 entries, 30 minutes) server-side ledger. A write whose socket
+disconnects after it started keeps running and records its terminal outcome,
+so a daemon can resolve it after reconnecting. The ledger covers the current
+run only; after a game restart `state` is `unknown` and a blind retry is not
+safe. `request_status` needs `read` or `write` for the same credential (it only
+reveals its own requests).
 
 ### Exclusive leases (mc-agent#6)
 
@@ -184,12 +221,14 @@ Every pushed event is a server-sequenced envelope:
 ```
 
 `seq` is monotonic within a run. On reconnect the client sends its last seen
-`lastSeq`; the server replays buffered envelopes from `lastSeq+1`, marking each
-with `"replay":true`. If the buffer no longer reaches back, `welcome.replay`
-reports `lost:true` with the `from`/`to` boundaries. The default buffer holds
-1024 events; a slow consumer that cannot keep up has events dropped (counted
-and visible in `STATE.control`) but can always recover by reconnecting with its
-last complete sequence and reading the gap report.
+`lastSeq` (with the run it belongs to); the server replays buffered envelopes
+from `lastSeq+1`, marking each with `"replay":true`. Replay, the welcome frame
+and the switch to live delivery happen under one lock, so a live event is never
+reordered before or lost behind a replayed one. If the buffer no longer reaches
+back, `welcome.replay` reports `lost:true` with the `from`/`to` boundaries; a
+cursor from another run is reported with `crossRun:true`. A session whose
+reader cannot drain the outbound queue is closed rather than silently dropping
+events, so the next reconnect always produces a machine-readable replay report.
 
 ## Limits and safety budgets
 
@@ -201,7 +240,12 @@ last complete sequence and reading the gap report.
 | `mcagent.controlMaxPending` | 32 | in-flight requests per session |
 | `mcagent.controlRequestTimeoutMillis` | 30000 | default operation deadline |
 | `mcagent.controlEventBuffer` | 1024 | replay ring size |
-| `mcagent.controlMaxDroppedEvents` | 4096 | slow-consumer drop bound |
+| `mcagent.controlMaxDroppedEvents` | 4096 | retained for diagnostics; a session that cannot drain is closed |
+
+Replies and events share a bounded outbound path: any frame queued while the
+channel is above its write-buffer water mark closes the session instead of
+growing an unbounded queue, and the game thread is never blocked by a slow
+reader.
 
 Game operations are always executed on the server thread; the network side
 only frames, authenticates and queues.

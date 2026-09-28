@@ -10,7 +10,8 @@
       "client": {
         "name": "mc-agent",
         "version": "0.5.0"
-      }
+      },
+      "runId": "run_824732565fd44d07"
     },
     "welcome": {
       "type": "welcome",
@@ -24,10 +25,22 @@
       "sessionId": "sess_b7be55ef9e354abb",
       "transport": "same-port-tls",
       "serverTimeMillis": 1790585489500,
-      "permissions": ["read", "write"],
+      "permissions": [
+        "read",
+        "write"
+      ],
       "capabilities": [
-        "state", "entities", "player", "player:view", "command",
-        "context", "wait", "mark", "snapshot", "events:game", "events:chat"
+        "state",
+        "entities",
+        "player",
+        "player:view",
+        "command",
+        "context",
+        "wait",
+        "mark",
+        "snapshot",
+        "events:game",
+        "events:chat"
       ],
       "replay": {
         "requestedSince": 42,
@@ -35,7 +48,8 @@
         "to": 57,
         "lost": false,
         "bufferedEvents": 15,
-        "persistedAcrossRuns": false
+        "persistedAcrossRuns": false,
+        "crossRun": false
       },
       "limits": {
         "maxFrameBytes": 16777216,
@@ -68,7 +82,9 @@
       "result": {
         "type": "cmd_ack",
         "detail": "say hello",
-        "output": ["[Server] hello"],
+        "output": [
+          "[Server] hello"
+        ],
         "writeSeq": 4,
         "duplicate": false,
         "requestId": "c1"
@@ -82,7 +98,9 @@
       "result": {
         "type": "cmd_ack",
         "detail": "say hello",
-        "output": ["[Server] hello"],
+        "output": [
+          "[Server] hello"
+        ],
         "writeSeq": 4,
         "duplicate": true,
         "requestId": "c1"
