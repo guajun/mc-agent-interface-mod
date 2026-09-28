@@ -740,6 +740,8 @@ def main() -> int:
                      help="probe hold for the reopen attempt, where the probe closes itself")
 
     args = parser.parse_args()
+    if args.scenario == "lan" and args.keep:
+        parser.error("--keep is only supported for dedicated: the LAN source world must be stopped before copying")
     if args.probe is not None and not args.probe.is_file():
         raise SystemExit(f"--probe is not a file: {args.probe}")
     if not args.mod_jar.is_file():

@@ -1,5 +1,5 @@
 {
-  "issue": "guajun/mc-agent-interface#7",
+  "issue": "guajun/mc-agent-interface-mod#7",
   "revision": "review-1 fixes (short-handshake framing, disconnect classification, world-save safety, event capability, honest LAN close wording)",
   "recorded": "2026-09-28",
   "environment": {

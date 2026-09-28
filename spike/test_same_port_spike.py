@@ -131,6 +131,7 @@ class CleanupTests(unittest.TestCase):
     def discard(self, guard, process) -> None:
         if process.poll() is None:
             process.kill()
+        process.wait(timeout=10)
         if guard in driver.Cleanup.INSTANCES:
             driver.Cleanup.INSTANCES.remove(guard)
 
