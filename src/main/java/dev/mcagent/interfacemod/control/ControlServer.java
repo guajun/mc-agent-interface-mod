@@ -231,6 +231,8 @@ public final class ControlServer {
         try {
             sslContext = material.sslContext();
             tlsFingerprint = material.fingerprint;
+            // Expose the public identity only once the listener can present it.
+            ControlTls.writePublicIdentity(directory, material);
         } catch (Exception exception) {
             tlsProblem = exception.getMessage();
             log("formal control is DISABLED: cannot build the TLS context: " + exception);

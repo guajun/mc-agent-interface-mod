@@ -111,7 +111,6 @@ public final class ControlTls {
             material = loadKeystore(keystore, password, DEFAULT_ALIAS);
         }
 
-        writePublicIdentity(directory, material);
         return material;
     }
 
@@ -201,7 +200,12 @@ public final class ControlTls {
                 + directory.toAbsolutePath() + " (SAN " + sans + ")");
     }
 
-    private static void writePublicIdentity(Path directory, Material material) throws IOException {
+    /**
+     * Write the public certificate and fingerprint files. Called only after the
+     * TLS context has been built, so the fingerprint never advertises an
+     * identity the listener cannot actually present.
+     */
+    public static void writePublicIdentity(Path directory, Material material) throws IOException {
         Path certificate = directory.resolve(CERTIFICATE_FILE);
         Path fingerprint = directory.resolve(FINGERPRINT_FILE);
             String certificatePem;

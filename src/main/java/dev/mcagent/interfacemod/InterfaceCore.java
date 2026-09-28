@@ -182,6 +182,31 @@ public final class InterfaceCore implements LineHandler {
             } else if (upper.startsWith("MARK ")) {
                 emit("mark", line.substring(5));
                 reply.accept(ack("mark", line.substring(5)).toString());
+            } else if (upper.equals("WORLD_CLOSE") || upper.equals("QUIT_WORLD")) {
+                // Test-only lifecycle helper for issue #7: the in-game
+                // "Save and Quit to Title" path, which closes the integrated
+                // server and stops the LAN listener. Off unless the dedicated
+                // test property is set, so it is not part of the product API.
+                if (!Boolean.getBoolean("mcagent.testClientCommands")) {
+                    reply.accept(errorJson("WORLD_CLOSE is a test-only command; "
+                            + "enable it with -Dmcagent.testClientCommands=true").toString());
+                } else {
+                    submit(this::quitWorld);
+                    reply.accept(ack("world_close", "requested").toString());
+                }
+            } else if (upper.equals("LAN_CLOSE") || upper.equals("UNPUBLISH")) {
+                // Test-only: the in-game "Close LAN" button. The world stays
+                // loaded; the listener stops, which is the same
+                // stopTcpServerListener path a world close uses, and control
+                // sessions are closed by the listener hook. A normal listener
+                // lifecycle the UI can drive without the save-and-quit screen.
+                if (!Boolean.getBoolean("mcagent.testClientCommands")) {
+                    reply.accept(errorJson("LAN_CLOSE is a test-only command; "
+                            + "enable it with -Dmcagent.testClientCommands=true").toString());
+                } else {
+                    submit(this::closeLan);
+                    reply.accept(ack("lan_close", "requested").toString());
+                }
             } else if (upper.startsWith("ECHO ")) {
                 reply.accept(ack("echo", line.substring(5)).toString());
             } else {
@@ -312,6 +337,46 @@ public final class InterfaceCore implements LineHandler {
         } catch (Throwable throwable) {
             reply.accept(errorJson("connect failed: " + throwable).toString());
         }
+    }
+
+    /**
+     * The in-game "Save and Quit to Title" path, without the button.
+     *
+     * This is the normal world lifecycle a player uses: the integrated server
+     * saves, stops and calls {@code stopTcpServerListener}, which closes the
+     * same-port control connections; the save can then be reopened and
+     * re-published on a new port. Only reachable while
+     * {@code mcagent.testClientCommands=true}; it exists so the #7 lifecycle
+     * acceptance can be driven without a human at the keyboard.
+     */
+    private void quitWorld() {
+        Minecraft client = Minecraft.getInstance();
+        if (client.level == null) {
+            emit("world_close", "not in a world");
+            return;
+        }
+        emit("world_close", "saving and quitting to title");
+        client.disconnectWithSavingScreen();
+    }
+
+    /**
+     * The in-game "Close LAN" action: unpublish the integrated server, which
+     * stops the listener and closes any same-port control sessions. Test-only,
+     * reachable while {@code mcagent.testClientCommands=true}.
+     */
+    private void closeLan() {
+        Minecraft client = Minecraft.getInstance();
+        if (!client.hasSingleplayerServer()) {
+            emit("lan_close", "no single-player world is open");
+            return;
+        }
+        IntegratedServer server = client.getSingleplayerServer();
+        if (server == null || !server.isPublished()) {
+            emit("lan_close", "the world is not published");
+            return;
+        }
+        boolean unpublished = server.unpublishServer();
+        emit("lan_close", "unpublished=" + unpublished);
     }
 
     /**

@@ -146,7 +146,9 @@ public final class ControlCommands {
             String secret = server.auth().issue(label, parsed, ttlSeconds <= 0 ? null : (long) ttlSeconds);
             feedback(source, "issued credential for '" + label + "' permissions=" + String.join("+", parsed)
                     + (ttlSeconds <= 0 ? "" : " ttl=" + ttlSeconds + "s"));
-            feedback(source, "SECRET (shown once): " + secret);
+            // A trailing space keeps console/RCON consumers from gluing the
+            // next feedback line onto the secret when parsing it.
+            feedback(source, "SECRET (shown once): " + secret + " ");
             feedback(source, "give this to the daemon operator; the server stores only a hash");
             return 1;
         } catch (IllegalArgumentException | IOException exception) {
