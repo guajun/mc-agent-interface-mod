@@ -57,7 +57,8 @@ nothing in it is committed.
 
    ```bash
    gh release download v0.8.0 --repo guajun/mc-agent-interface-mod
-   sha256sum -c checksums.txt
+   sha256sum -c checksums.txt          # Linux
+   shasum -a 256 -c checksums.txt      # macOS
    ```
 
 The release notes state the tested stack. Do not claim other Minecraft or
@@ -67,7 +68,8 @@ loader versions; the jar's metadata still allows the loader to try, but only
 ## User verification
 
 ```bash
-sha256sum -c checksums.txt
+sha256sum -c checksums.txt          # Linux
+shasum -a 256 -c checksums.txt      # macOS
 ```
 
 Then put exactly one interface jar next to Fabric API in `mods/`, start the

@@ -18,7 +18,8 @@ verify the SHA-256, and put the jar next to Fabric API in the instance's
 `mods/` directory (exactly one interface version):
 
 ```bash
-sha256sum -c checksums.txt
+sha256sum -c checksums.txt          # Linux
+shasum -a 256 -c checksums.txt      # macOS
 ```
 
 The tested stack is Minecraft 26.2, Fabric Loader 0.19.5, Fabric API 0.161.0
