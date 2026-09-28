@@ -3,7 +3,10 @@
   "package": "dev.mcagent.interfacemod.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
-    "ServerGamePacketListenerImplMixin"
+    "ServerGamePacketListenerImplMixin",
+    "SamePortConnectionMixin",
+    "SamePortListenerMixin",
+    "SamePortListenerAccessor"
   ],
   "injectors": {
     "defaultRequire": 1

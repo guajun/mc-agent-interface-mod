@@ -40,6 +40,7 @@ public final class InterfaceModTests {
         broadcastFallbackIsLabelled();
         publicationIsStructuredWithoutReceipts();
         unsignedReceiptKeySurvivesFiltering();
+        samePortMarkerIsDistinctFromVanillaHandshakes();
         System.out.println("all " + checks + " checks passed");
     }
 
@@ -331,6 +332,32 @@ public final class InterfaceModTests {
         PlayerChatMessage filtered = first.withUnsignedContent(Component.literal("first")).filter(true);
         check(firstKey.equals(ServerCore.receiptKey(filtered)),
                 "the receipt key survives withUnsignedContent and filter");
+    }
+
+    /**
+     * The issue #7 same-port marker must not collide with the start of a
+     * vanilla handshake. Vanilla begins with a VarInt frame length and packet
+     * id 0x00; the marker begins with 'M' 'C' and the third byte would be
+     * packet id 0x41, which is not a handshake packet.
+     */
+    private static void samePortMarkerIsDistinctFromVanillaHandshakes() {
+        byte[] marker = (InterfaceConstants.SAME_PORT_MAGIC).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        check(SamePortControl.matchesMagic(marker), "the marker matches itself");
+
+        byte[] shortPrefix = new byte[] {'M', 'C'};
+        check(!SamePortControl.matchesMagic(shortPrefix), "a short prefix is not a marker");
+        check(!SamePortControl.matchesMagic(null), "null is not a marker");
+
+        byte[] lowercase = "mcagent-control/1\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        check(!SamePortControl.matchesMagic(lowercase), "the marker is case sensitive");
+
+        byte[] vanillaStatus = new byte[] {0x10, 0x00, 0x7F, 0x09, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't',
+                (byte) 0xDD, 0x3D, 0x01, 0x01, 0x00};
+        check(!SamePortControl.matchesMagic(vanillaStatus), "a vanilla status handshake is not a marker");
+
+        byte[] vanillaLogin = new byte[] {0x11, 0x00, 0x76, 0x09, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't',
+                (byte) 0xDD, 0x3D, 0x02, 0x10, 'P', 'l', 'a', 'y'};
+        check(!SamePortControl.matchesMagic(vanillaLogin), "a vanilla login handshake is not a marker");
     }
 
     private static PlayerContext context(long seq, String id, long capturedAt, String uuid, String name) {

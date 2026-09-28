@@ -19,7 +19,7 @@ Messages are UTF-8 text, one JSON object per line.
 On connect the mod sends:
 
 ```json
-{"type":"hello","mod":"mc-agent-interface","version":"0.6.0","protocol":1,
+{"type":"hello","mod":"mc-agent-interface","version":"0.7.0","protocol":1,
  "minecraft":"26.2","port":25580,
  "capabilities":["state","entities","command","chat","record","wait","screen",
                   "mark","connect","events:chat","events:game"]}
@@ -171,7 +171,7 @@ by name as a convenience; `matchedBy` says which was used. The reply is the
 player's server-known state at request time:
 
 ```json
-{"type":"player","instance":"server","protocol":1,"modVersion":"0.6.0",
+{"type":"player","instance":"server","protocol":1,"modVersion":"0.7.0",
  "tick":104233,"query":"069a79f4-44e9-4726-a5be-fca90e38aaf5","found":true,
  "matchedBy":"uuid",
  "player":{"id":123,"uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5",
@@ -217,6 +217,45 @@ context) and `"player:view"` (the server-side view-target raycast). The socket
 still binds to loopback only, so a co-located Toolkit reaches it exactly like
 the client socket and nothing becomes public.
 
+## Same-port control spike (issue #7, experimental)
+
+The server vantage normally waits on its own loopback port (`mcagent.serverPort`).
+Issue #7 asks a harder question first: can a daemon-shaped, non-player
+connection be accepted on the **actual game port** itself, with no second
+listening socket, no sidecar daemon and no client relay? This build contains an
+explicitly opt-in spike that says yes on Minecraft 26.2; the reproducible
+experiments and results live in `spike/`.
+
+How it works:
+
+- a mixin arms one byte-sniffing handler at the head of every real TCP
+  serverbound connection, before Minecraft decodes anything;
+- a control connection starts with the ASCII marker
+  `MCAGENT-CONTROL/1` followed by a newline (provisional, not the #8 protocol);
+- when the marker is present, the handler removes the vanilla pipeline, detaches
+  the placeholder `Connection` from the server's connection list, and speaks the
+  existing JSON-lines protocol through the same server vantage - no player, no
+  entity, no join;
+- when it is absent, the handler removes itself and the buffered bytes flow into
+  the untouched vanilla pipeline, so a normal player is unaffected.
+
+Enable it only in an isolated test environment:
+
+```
+-Dmcagent.samePortSpike=true
+```
+
+It accepts unauthenticated control connections on the game port, so off-box
+control clients are refused unless `-Dmcagent.samePortSpikeAllowRemote=true` is
+also set. Authentication and the real wire protocol are issue #8; TLS and a
+formal version preamble are deliberately not decided here.
+
+The transport is verified on a dedicated server (two independent Go probes,
+plus a real client joining, quitting and reconnecting) and on a LAN-hosted
+integrated server (closing the world drops the connections; reopening it on a
+new port connects again). See `spike/README.md` for the design, the exact
+commands, the check-by-check results and the remaining gaps.
+
 ## Build
 
 Minecraft Java 26.2 ships unobfuscated class files, so the mod is compiled
@@ -229,7 +268,7 @@ python build.py \
   --jdk "C:/Program Files/Java/jdk-25"
 ```
 
-Output: `dist/mc-agent-interface-0.6.0.jar`. Put it together with
+Output: `dist/mc-agent-interface-0.7.0.jar`. Put it together with
 `fabric-api-*.jar` into the client's `mods/` directory.
 
 ## Tests
@@ -276,6 +315,11 @@ python tests/player_context_test.py --port 25581 --allow-world-edits
 | `mcagent.serverPort` | `25581` | server vantage: first port to try |
 | `mcagent.contextCacheSize` | `256` | server vantage: chat context bundles kept in memory |
 | `mcagent.contextCacheTtlSeconds` | `300` | server vantage: how long a bundle stays fetchable after capture |
+| `mcagent.samePortSpike` | `false` | issue #7 spike: accept control connections on the game port (isolated tests only) |
+| `mcagent.samePortSpikeAllowRemote` | `false` | spike: also accept non-loopback control clients (private LAN only) |
+| `mcagent.samePortSpikeHandshakeSeconds` | `10` | spike: close a connection that sends no marker within this many seconds |
+| `mcagent.samePortSpikeIdleSeconds` | `300` | spike: close an idle control session after this many seconds |
+| `mcagent.samePortSpikeMaxLineBytes` | `65536` | spike: maximum control request line length |
 
 ## In-game commands
 

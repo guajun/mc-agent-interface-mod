@@ -24,11 +24,15 @@ public final class ServerMod implements ModInitializer {
         Path dir = Path.of(System.getProperty("mcagent.serverDir", "mc-agent-server"));
         int port = Integer.getInteger("mcagent.serverPort", InterfaceConstants.DEFAULT_SERVER_PORT);
 
+        SamePortControl.logConfiguration();
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             core = new ServerCore(server, dir, port);
             core.start();
+            SamePortControl.attach(core);
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
+            SamePortControl.closeAll("server stopping");
+            SamePortControl.detach();
             if (core != null) {
                 core.stop();
                 core = null;

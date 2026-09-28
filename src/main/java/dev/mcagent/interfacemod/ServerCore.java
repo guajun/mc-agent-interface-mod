@@ -237,6 +237,9 @@ public final class ServerCore implements LineHandler {
             levels.add(entry);
         }
         object.add("levels", levels);
+        // Issue #7 evidence: what the experimental same-port control transport
+        // sees. Disabled builds report enabled=false and no sessions.
+        object.add("samePortSpike", SamePortControl.state());
         return object;
     }
 
