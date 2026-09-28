@@ -54,7 +54,40 @@ public final class ControlProtocolTests {
         tlsIdentity();
         snifferDecision();
         endToEndTls();
+        fixtureContract();
         System.out.println("control protocol: " + checks + " checks passed");
+    }
+
+    /**
+     * The cross-language fixture is the written contract; parse it and check
+     * the frames carry the fields both implementations rely on.
+     */
+    private void fixtureContract() throws Exception {
+        Path fixture = Path.of("protocol", "fixtures", "control-protocol-1.json");
+        check(Files.isRegularFile(fixture), "the protocol fixture is committed");
+        JsonObject root = JsonParser.parseString(Files.readString(fixture)).getAsJsonObject();
+        check(root.get("protocol").getAsInt() == ControlServer.CONTROL_PROTOCOL_VERSION,
+                "fixture protocol matches the server");
+        JsonObject frames = root.getAsJsonObject("frames");
+        JsonObject welcome = frames.getAsJsonObject("welcome");
+        check(welcome.get("protocol").getAsInt() == ControlServer.CONTROL_PROTOCOL_VERSION,
+                "fixture welcome negotiates protocol 1");
+        check(welcome.has("instanceId") && welcome.has("runId") && welcome.has("sessionId")
+                        && welcome.has("replay") && welcome.has("limits"),
+                "fixture welcome carries identity, replay and limits");
+        check(frames.getAsJsonObject("hello").get("token").getAsString().startsWith("mca1."),
+                "fixture hello carries a credential");
+        check(frames.getAsJsonObject("replyError").getAsJsonObject("error")
+                        .get("code").getAsString().equals("forbidden"),
+                "fixture error frame carries a stable code");
+        check(frames.getAsJsonObject("replyTimeoutUnknown").getAsJsonObject("error")
+                        .get("resultUnknown").getAsBoolean(),
+                "fixture documents the result-unknown shape");
+        check(frames.getAsJsonObject("writeEvent").getAsJsonObject("event")
+                        .get("type").getAsString().equals("write"),
+                "fixture documents the ordered write event");
+        check(frames.getAsJsonObject("replayedEvent").get("replay").getAsBoolean(),
+                "fixture documents the replay marker");
     }
 
     // ------------------------------------------------------------------- auth
