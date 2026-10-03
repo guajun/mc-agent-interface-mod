@@ -3,6 +3,7 @@ package dev.mcagent.interfacemod;
 import dev.mcagent.interfacemod.control.ControlOps;
 import dev.mcagent.interfacemod.control.ControlPaths;
 import dev.mcagent.interfacemod.control.ControlServer;
+import dev.mcagent.interfacemod.control.GameReplies;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
@@ -172,14 +173,14 @@ public final class ServerCore implements LineHandler, ControlOps {
 
     private void runControlOperation(String operation, JsonObject params, ControlOps.Reply reply) {
         switch (operation) {
-            case "state" -> reply.ok(stateJson());
+            case "state" -> GameReplies.complete(reply, stateJson());
             case "entities" -> {
                 double radius = doubleParam(params, "radius", 0.0D);
                 if (radius < 0.0D) {
                     reply.fail("bad_request", "radius cannot be negative", false, false);
                     return;
                 }
-                reply.ok(entitiesJson(radius));
+                GameReplies.complete(reply, entitiesJson(radius));
             }
             case "player" -> {
                 String query = firstNonEmpty(params, "player", "uuid", "name", "id");
@@ -187,7 +188,7 @@ public final class ServerCore implements LineHandler, ControlOps {
                     reply.fail("bad_request", "player needs a name or uuid", false, false);
                     return;
                 }
-                reply.ok(playerJson(query));
+                GameReplies.complete(reply, playerJson(query));
             }
             case "context" -> {
                 String id = firstNonEmpty(params, "contextId", "context_id", "id", "context");
@@ -195,7 +196,7 @@ public final class ServerCore implements LineHandler, ControlOps {
                     reply.fail("bad_request", "context needs an id", false, false);
                     return;
                 }
-                reply.ok(contextJson(id));
+                GameReplies.complete(reply, contextJson(id));
             }
             case "command" -> {
                 String command = stringParam(params, "command");
@@ -209,7 +210,7 @@ public final class ServerCore implements LineHandler, ControlOps {
             case "mark" -> {
                 String text = oneLine(stringParam(params, "text"));
                 emit("mark", text);
-                reply.ok(ack("mark", text));
+                GameReplies.complete(reply, ack("mark", text));
             }
             case "wait" -> {
                 long ticks = longParam(params, "ticks", 1L);
@@ -221,7 +222,7 @@ public final class ServerCore implements LineHandler, ControlOps {
             }
             case "snapshot" -> snapshot(doubleParam(params, "radius", 0.0D),
                     stringParam(params, "name"), stringParam(params, "dimension"), lineReply(reply));
-            case "snapshots" -> reply.ok(listSnapshots());
+            case "snapshots" -> GameReplies.complete(reply, listSnapshots());
             default -> reply.fail("capability_not_supported",
                     "operation " + operation + " is not available on the server vantage", false, false);
         }
@@ -229,21 +230,7 @@ public final class ServerCore implements LineHandler, ControlOps {
 
     /** Wrap the legacy JSON-string reply into the structured control reply. */
     private Consumer<String> lineReply(ControlOps.Reply reply) {
-        return answer -> {
-            JsonObject parsed;
-            try {
-                parsed = JsonParser.parseString(answer).getAsJsonObject();
-            } catch (RuntimeException exception) {
-                reply.fail("internal", "unreadable answer from the game: " + exception, false, false);
-                return;
-            }
-            if ("error".equals(parsed.get("type").getAsString())) {
-                reply.fail("game_error", parsed.has("message") ? parsed.get("message").getAsString()
-                        : "the game reported an error", false, false);
-                return;
-            }
-            reply.ok(parsed);
-        };
+        return GameReplies.line(reply);
     }
 
     private static String stringParam(JsonObject params, String name) {

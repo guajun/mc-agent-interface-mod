@@ -52,6 +52,7 @@ public final class InterfaceModTests {
         samePortMarkerIsDistinctFromVanillaHandshakes();
         samePortSnifferFramesShortAndFragmentedTraffic();
         new dev.mcagent.interfacemod.control.ControlProtocolTests().run();
+        new dev.mcagent.interfacemod.control.GameReplyTests().run();
         new dev.mcagent.interfacemod.control.ControlRegressionTests().run();
         System.out.println("all " + checks + " checks passed");
     }
