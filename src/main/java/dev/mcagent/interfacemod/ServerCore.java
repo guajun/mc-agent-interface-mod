@@ -175,12 +175,11 @@ public final class ServerCore implements LineHandler, ControlOps {
         switch (operation) {
             case "state" -> GameReplies.complete(reply, stateJson());
             case "entities" -> {
-                double radius = doubleParam(params, "radius", 0.0D);
-                if (radius < 0.0D) {
-                    reply.fail("bad_request", "radius cannot be negative", false, false);
+                if (params.has("radius")) {
+                    reply.fail("bad_request", "radius filtering was removed; filter NBT locally or use a game command", false, false);
                     return;
                 }
-                GameReplies.complete(reply, entitiesJson(radius));
+                GameReplies.complete(reply, entitiesJson(stringParam(params, "dimension")));
             }
             case "player" -> {
                 String query = firstNonEmpty(params, "player", "uuid", "name", "id");
@@ -220,8 +219,13 @@ public final class ServerCore implements LineHandler, ControlOps {
                 }
                 waits.add(new Wait((int) ticks, lineReply(reply)));
             }
-            case "snapshot" -> snapshot(doubleParam(params, "radius", 0.0D),
-                    stringParam(params, "name"), stringParam(params, "dimension"), lineReply(reply));
+            case "snapshot" -> {
+                if (params.has("radius")) {
+                    reply.fail("bad_request", "radius filtering was removed; snapshot captures the dimension", false, false);
+                    return;
+                }
+                snapshot(0.0D, stringParam(params, "name"), stringParam(params, "dimension"), lineReply(reply));
+            }
             case "snapshots" -> GameReplies.complete(reply, listSnapshots());
             default -> reply.fail("capability_not_supported",
                     "operation " + operation + " is not available on the server vantage", false, false);
@@ -319,10 +323,14 @@ public final class ServerCore implements LineHandler, ControlOps {
             } else if (upper.equals("STATE") || upper.equals("STATE_GET")) {
                 submit(reply, () -> reply.accept(stateJson().toString()));
             } else if (upper.equals("ENTITIES") || upper.equals("ENTITY_LIST")) {
-                submit(reply, () -> reply.accept(entitiesJson(0.0D).toString()));
+                submit(reply, () -> reply.accept(entitiesJson(null).toString()));
             } else if (upper.startsWith("ENTITIES ") || upper.startsWith("ENTITY_LIST ")) {
-                double radius = Double.parseDouble(line.substring(upper.startsWith("ENTITIES ") ? 9 : 12).trim());
-                submit(reply, () -> reply.accept(entitiesJson(radius).toString()));
+                String dimension = line.substring(upper.startsWith("ENTITIES ") ? 9 : 12).trim();
+                if (!dimension.contains(":")) {
+                    reply.accept(errorJson("ENTITIES expects a dimension id; radius filtering was removed").toString());
+                } else {
+                    submit(reply, () -> reply.accept(entitiesJson(dimension).toString()));
+                }
             } else if (upper.startsWith("CMD ") || upper.startsWith("COMMAND ")) {
                 String command = line.substring(upper.startsWith("CMD ") ? 4 : 8).trim();
                 submit(reply, () -> runCommand(command, reply));
@@ -822,33 +830,76 @@ public final class ServerCore implements LineHandler, ControlOps {
 
     // ------------------------------------------------------------------ entities
 
-    private JsonObject entitiesJson(double radius) {
+    private JsonObject entitiesJson(String dimension) {
+        ServerLevel level;
+        try {
+            level = snapshotLevel(dimension);
+        } catch (IllegalArgumentException exception) {
+            return errorJson(exception.getMessage());
+        }
         JsonObject object = base("entities");
+        object.addProperty("schema", "entity-nbt/1");
         object.addProperty("instance", "server");
         object.addProperty("tick", server.getTickCount());
-        object.addProperty("radius", radius);
+        object.addProperty("dimension", level.dimension().identifier().toString());
         JsonArray array = new JsonArray();
-        ServerLevel level = primaryLevel();
-        if (level != null) {
-            double[] origin = radius > 0.0D ? playerOrigin(level) : null;
-            if (radius > 0.0D && origin == null) {
-                return errorJson("a radius needs at least one player; use ENTITIES for everything");
+        List<Entity> entities = tickOrder(level);
+        List<Entity> restorable = new ArrayList<>();
+        int playersSkipped = 0;
+        for (Entity entity : entities) {
+            if (entity instanceof ServerPlayer) {
+                playersSkipped++;
+                continue;
             }
-            for (Entity entity : tickOrder(level)) {
-                if (origin != null) {
-                    double dx = entity.getX() - origin[0];
-                    double dy = entity.getY() - origin[1];
-                    double dz = entity.getZ() - origin[2];
-                    if (dx * dx + dy * dy + dz * dz > radius * radius) {
-                        continue;
-                    }
-                }
-                array.add(EntityJson.toJson(entity));
-            }
+            array.add(entityNbt(entity, restorable.size()));
+            restorable.add(entity);
         }
-        object.addProperty("dimension", level == null ? "" : level.dimension().identifier().toString());
+        object.addProperty("playersSkipped", playersSkipped);
+        object.addProperty("orderHash", orderHash(restorable));
         object.add("entities", array);
         return object;
+    }
+
+    private ServerLevel snapshotLevel(String dimension) {
+        String id = dimension == null || dimension.isBlank() ? "minecraft:overworld" : dimension.trim();
+        ServerLevel level = server.getLevel(net.minecraft.resources.ResourceKey.create(
+                net.minecraft.core.registries.Registries.DIMENSION, Identifier.parse(id)));
+        if (level == null) {
+            throw new IllegalArgumentException("no such dimension: " + id);
+        }
+        return level;
+    }
+
+    /** Shared wire/file representation; ordinary state remains in NBT. */
+    private JsonObject entityNbt(Entity entity, int order) {
+        JsonObject entry = new JsonObject();
+        entry.addProperty("order", order);
+        entry.addProperty("uuid", entity.getStringUUID());
+        entry.addProperty("type", EntityType.getKey(entity.getType()).toString());
+        JsonArray position = new JsonArray();
+        position.add(entity.getX());
+        position.add(entity.getY());
+        position.add(entity.getZ());
+        entry.add("pos", position);
+        // Kept for existing fidelity consumers; NBT remains authoritative.
+        JsonArray velocity = new JsonArray();
+        velocity.add(entity.getDeltaMovement().x);
+        velocity.add(entity.getDeltaMovement().y);
+        velocity.add(entity.getDeltaMovement().z);
+        entry.add("vel", velocity);
+        entry.addProperty("nbt", snbtOf(entity));
+        JsonArray passengers = new JsonArray();
+        for (Entity passenger : entity.getPassengers()) {
+            passengers.add(passenger.getStringUUID());
+        }
+        entry.add("passengers", passengers);
+        if (entity.getVehicle() == null) {
+            entry.add("vehicle", com.google.gson.JsonNull.INSTANCE);
+        } else {
+            entry.addProperty("vehicle", entity.getVehicle().getStringUUID());
+        }
+        entry.addProperty("restorable", entity.getVehicle() == null);
+        return entry;
     }
 
     /**
@@ -890,15 +941,6 @@ public final class ServerCore implements LineHandler, ControlOps {
         return server.overworld();
     }
 
-    private double[] playerOrigin(ServerLevel level) {
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.level() == level) {
-                return new double[] {player.getX(), player.getY(), player.getZ()};
-            }
-        }
-        return null;
-    }
-
     // ------------------------------------------------------------------ snapshots
 
     private void snapshot(String rest, Consumer<String> reply) {
@@ -923,8 +965,8 @@ public final class ServerCore implements LineHandler, ControlOps {
         double radius = radiusValue == null ? 0.0D : radiusValue;
         String name = nameValue == null || nameValue.isBlank() ? null : nameValue.trim();
         String dimension = dimensionValue == null || dimensionValue.isBlank() ? null : dimensionValue.trim();
-        if (radius < 0.0D) {
-            reply.accept(errorJson("radius cannot be negative").toString());
+        if (radius != 0.0D) {
+            reply.accept(errorJson("radius filtering was removed; snapshot captures the dimension").toString());
             return;
         }
         if (name == null) {
@@ -940,36 +982,14 @@ public final class ServerCore implements LineHandler, ControlOps {
             return;
         }
 
-        ServerLevel level = dimension == null
-                ? primaryLevel()
-                : server.getLevel(net.minecraft.resources.ResourceKey.create(
-                        net.minecraft.core.registries.Registries.DIMENSION,
-                        Identifier.parse(dimension)));
-        if (level == null) {
-            reply.accept(errorJson("no such dimension: " + dimension).toString());
+        ServerLevel level;
+        try {
+            level = snapshotLevel(dimension);
+        } catch (IllegalArgumentException exception) {
+            reply.accept(errorJson(exception.getMessage()).toString());
             return;
         }
-
-        double[] origin = radius > 0.0D ? playerOrigin(level) : null;
-        if (radius > 0.0D && origin == null) {
-            reply.accept(errorJson("a radius needs a player in that dimension; use radius 0 for everything").toString());
-            return;
-        }
-
         List<Entity> entities = tickOrder(level);
-        if (origin != null) {
-            double radiusSquared = radius * radius;
-            List<Entity> within = new ArrayList<>();
-            for (Entity entity : entities) {
-                double dx = entity.getX() - origin[0];
-                double dy = entity.getY() - origin[1];
-                double dz = entity.getZ() - origin[2];
-                if (dx * dx + dy * dy + dz * dz <= radiusSquared) {
-                    within.add(entity);
-                }
-            }
-            entities = within;
-        }
 
         // A snapshot is "the world state that can be put back". A player cannot be
         // recreated with /summon, so players are recorded in meta (name, uuid,
@@ -1004,38 +1024,7 @@ public final class ServerCore implements LineHandler, ControlOps {
             try (BufferedWriter writer = Files.newBufferedWriter(entitiesFile, StandardCharsets.UTF_8,
                     StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
                 for (Entity entity : entities) {
-                    JsonObject entry = new JsonObject();
-                    entry.addProperty("order", order++);
-                    entry.addProperty("uuid", entity.getStringUUID());
-                    entry.addProperty("type", EntityType.getKey(entity.getType()).toString());
-                    entry.addProperty("entityId", entity.getId());
-                    JsonArray position = new JsonArray();
-                    position.add(entity.getX());
-                    position.add(entity.getY());
-                    position.add(entity.getZ());
-                    entry.add("pos", position);
-                    JsonArray velocity = new JsonArray();
-                    velocity.add(entity.getDeltaMovement().x);
-                    velocity.add(entity.getDeltaMovement().y);
-                    velocity.add(entity.getDeltaMovement().z);
-                    entry.add("vel", velocity);
-                    entry.addProperty("yaw", entity.getYRot());
-                    entry.addProperty("pitch", entity.getXRot());
-                    entry.addProperty("nbt", snbtOf(entity));
-                    JsonArray passengers = new JsonArray();
-                    for (Entity passenger : entity.getPassengers()) {
-                        passengers.add(passenger.getStringUUID());
-                    }
-                    entry.add("passengers", passengers);
-                    if (entity.getVehicle() == null) {
-                        entry.add("vehicle", com.google.gson.JsonNull.INSTANCE);
-                    } else {
-                        entry.addProperty("vehicle", entity.getVehicle().getStringUUID());
-                    }
-                    // Passengers come back with their vehicle (their NBT is nested
-                    // inside it), so a restore has to skip them rather than summon
-                    // them twice. The flag says which ones.
-                    entry.addProperty("restorable", entity.getVehicle() == null);
+                    JsonObject entry = entityNbt(entity, order++);
                     writer.write(GSON.toJson(entry));
                     writer.newLine();
                 }
@@ -1065,7 +1054,7 @@ public final class ServerCore implements LineHandler, ControlOps {
         meta.addProperty("instance", "server");
         meta.addProperty("tick", server.getTickCount());
         meta.addProperty("dimension", level.dimension().identifier().toString());
-        meta.addProperty("radius", radius);
+        meta.addProperty("schema", "entity-nbt/1");
         meta.addProperty("entities", entities.size());
         meta.addProperty("playersSkipped", players.size());
         meta.add("players", playerInfo);
@@ -1081,6 +1070,7 @@ public final class ServerCore implements LineHandler, ControlOps {
         }
 
         JsonObject answer = ack("snapshot", "name=" + name + " entities=" + entities.size());
+        answer.addProperty("schema", "entity-nbt/1");
         answer.addProperty("id", name);
         answer.addProperty("dir", snapshotDir.toAbsolutePath().toString());
         answer.addProperty("entities", entities.size());
@@ -1108,7 +1098,7 @@ public final class ServerCore implements LineHandler, ControlOps {
                             JsonObject parsed = JsonParser.parseString(Files.readString(meta))
                                     .getAsJsonObject();
                             for (String key : new String[] {"entities", "tick", "orderHash", "createdAt",
-                                    "dimension", "radius"}) {
+                                    "dimension", "schema"}) {
                                 if (parsed.has(key)) {
                                     entry.add(key, parsed.get(key));
                                 }

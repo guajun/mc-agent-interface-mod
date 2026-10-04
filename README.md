@@ -12,7 +12,7 @@ client.
 
 ## Install
 
-Download `mc-agent-interface-0.8.0.jar` and `checksums.txt` from the
+Download `mc-agent-interface-0.9.0.jar` and `checksums.txt` from the
 [releases page](https://github.com/guajun/mc-agent-interface-mod/releases),
 verify the SHA-256, and put the jar next to Fabric API in the instance's
 `mods/` directory (exactly one interface version):
@@ -37,7 +37,7 @@ Messages are UTF-8 text, one JSON object per line.
 On connect the mod sends:
 
 ```json
-{"type":"hello","mod":"mc-agent-interface","version":"0.8.0","protocol":1,
+{"type":"hello","mod":"mc-agent-interface","version":"0.9.0","protocol":1,
  "minecraft":"26.2","port":25580,
  "capabilities":["state","entities","command","chat","record","wait","screen",
                   "mark","connect","events:chat","events:game"]}
@@ -49,7 +49,7 @@ stable:
 | Request | Meaning |
 | --- | --- |
 | `STATE` | player position/rotation/health/dimension, entity count |
-| `ENTITIES [radius]` | entity snapshot (optionally limited by radius) |
+| `ENTITIES [radius]` | legacy client synchronized entity view (not server NBT) |
 | `CMD <command>` | run a server command as the local player |
 | `CHAT <text>` | send a chat message |
 | `SAMPLE_START <ticks> <radius> [interval]` | start per-tick entity recording |
@@ -180,7 +180,8 @@ requests plus:
 | Request | Meaning |
 | --- | --- |
 | `PLAYER <uuid\|name>` | one online player's server-known context and view target |
-| `SNAPSHOT [radius] [name]` / `SNAPSHOTS` | fork/list a live world (snapshot protocol) |
+| `ENTITIES [dimension]` | server non-player NBT in tick order (default overworld) |
+| `SNAPSHOT [name] [dimension]` / `SNAPSHOTS` | write/list entity NBT snapshots on the game host |
 
 ### `PLAYER`
 
@@ -326,7 +327,7 @@ python build.py \
   --jdk "C:/Program Files/Java/jdk-25"
 ```
 
-Output: `dist/mc-agent-interface-0.8.0.jar` (the version comes from
+Output: `dist/mc-agent-interface-0.9.0.jar` (the version comes from
 `src/main/resources/fabric.mod.json`). Put it together with
 `fabric-api-*.jar` into the client's `mods/` directory.
 
@@ -459,3 +460,28 @@ Those live in the sibling repositories (`mc-agent-bridge`, `mc-agent-loop`).
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Server entity capture boundary (0.9.0)
+
+The server advertises `entities:nbt` and `snapshot:entity-nbt`. `entities` accepts only an optional
+`dimension` (default `minecraft:overworld`) and returns `schema: entity-nbt/1`,
+`tick`, `dimension`, `orderHash`, `playersSkipped` and `entities`. Each record
+contains `order`, `uuid`, `type`, `pos`, `nbt`, `passengers`, `vehicle`,
+`restorable`, and the compatibility `vel` field used by fidelity comparisons.
+The same serializer writes `snapshot` JSONL. `entityId`, `yaw` and `pitch`
+projections were removed; the persisted transform is in NBT.
+
+Player-centered radius filtering is removed. Structured `radius` parameters
+are rejected, including zero; legacy `SNAPSHOT 0 name [dimension]` remains
+accepted only as a positional compatibility form. Nonzero legacy radius is
+rejected. Use vanilla commands or local processing to filter ordinary data.
+Players are excluded because they cannot be restored by summon. Summon only
+records with `restorable: true`, in recorded order: nested passengers return
+with their vehicle. The legacy client `ENTITIES`/recording endpoint is an old
+synchronized projection, not this authoritative NBT contract.
+
+Inline NBT is bounded by the existing negotiated frame limit (8 MiB default);
+it is not a paginated or complete-world transfer. Large captures may exceed
+that limit. Disk snapshots are on the game host, not automatically on the
+Harness machine. Neither interface freezes, unloads, reloads or saves chunks;
+this entity capture alone does not promise a complete non-invasive world fork.

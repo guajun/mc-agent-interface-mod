@@ -8,7 +8,7 @@ package dev.mcagent.interfacemod;
  */
 public final class InterfaceConstants {
     public static final String MOD_ID = "mc-agent-interface";
-    public static final String VERSION = "0.8.0";
+    public static final String VERSION = "0.9.0";
     public static final int PROTOCOL_VERSION = 1;
     public static final String MINECRAFT_VERSION = "26.2";
 
@@ -43,7 +43,7 @@ public final class InterfaceConstants {
     public static final String SAME_PORT_TRANSPORT = "same-port-spike";
 
     public static final String SERVER_CAPABILITIES =
-            "[\"state\",\"entities\",\"player\",\"player:view\",\"command\",\"context\",\"wait\",\"mark\",\"snapshot\","
+            "[\"state\",\"entities\",\"entities:nbt\",\"player\",\"player:view\",\"command\",\"context\",\"wait\",\"mark\",\"snapshot\",\"snapshot:entity-nbt\","
                     + "\"events:game\",\"events:chat\"]";
 
     private InterfaceConstants() {

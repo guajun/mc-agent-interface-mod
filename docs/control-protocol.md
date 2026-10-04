@@ -105,8 +105,8 @@ The server answers with `welcome` (or a fatal `error`, then closes):
  "minecraft":"26.2","instanceId":"inst_...","runId":"run_...","runStartedAtMillis":0,
  "sessionId":"sess_...","transport":"same-port-tls","serverTimeMillis":0,
  "permissions":["read","write"],
- "capabilities":["state","entities","player","player:view","command","context",
-                 "wait","mark","snapshot","events:game","events:chat"],
+ "capabilities":["state","entities","entities:nbt","player","player:view","command","context",
+                 "wait","mark","snapshot","snapshot:entity-nbt","events:game","events:chat"],
  `replay":{"requestedSince":42,"from":43,"to":57,"lost":false,
            "bufferedEvents":15,"persistedAcrossRuns":false,"crossRun":false},
  "limits":{"maxFrameBytes":16777216,"maxPendingRequests":32,
@@ -280,3 +280,19 @@ hello/welcome/reply/error/event frames. The Go daemon
 (`ControlSession`) are the two implementations exercised end to end; the
 fixtures exist so a third implementation can be checked without reading either
 codebase.
+
+### Entity NBT contract
+
+Mod 0.9.0 advertises `entities:nbt` for the `entities` read operation and
+`snapshot:entity-nbt` for disk capture. Optional
+`dimension` defaults to `minecraft:overworld`; `radius` is rejected.
+The response uses `schema: entity-nbt/1` and includes ordered non-player NBT
+records, `tick`, `dimension`, `orderHash`, and `playersSkipped`. Records match
+snapshot JSONL: `order`, `uuid`, `type`, `pos`, `nbt`, `passengers`, `vehicle`,
+`restorable`, and compatibility `vel`. Snapshot accepts `name` and `dimension`,
+not radius. Both capture the dimension's surviving entity tick-list entries,
+not every persisted or loaded entity, and neither triggers chunk unload.
+
+The existing frame limit also applies to inline NBT: there is no pagination
+or world-file transfer in this operation. A disk snapshot is a game-host
+artifact. Entity capture is not a full non-invasive world fork.
